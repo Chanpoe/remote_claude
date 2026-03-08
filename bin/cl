@@ -1,0 +1,12 @@
+#!/bin/bash
+# 解析符号链接，兼容 macOS（不支持 readlink -f）
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && cd .. && pwd)"
+
+uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/remote_claude.py" lark start
+uv run --project "$SCRIPT_DIR" python3 "$SCRIPT_DIR/remote_claude.py" start "${PWD}_$(date +%m%d_%H%M%S)" -- --dangerously-skip-permissions --permission-mode=dontAsk

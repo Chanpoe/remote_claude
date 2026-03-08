@@ -189,34 +189,104 @@ def _safe_truncate(text: str, limit: int) -> str:
     return truncated.rstrip() + '\n\n*...（内容过长，仅显示部分）*'
 
 
-def _build_menu_button_row() -> Dict[str, Any]:
-    """底部快捷菜单按钮行（⚡菜单 + 快捷键按钮），用于流式卡片"""
-    buttons = [
-        ("⚡ 菜单", {"action": "menu_open"}),
+def _build_menu_button_row() -> List[Dict[str, Any]]:
+    """底部快捷菜单按钮行（form: 菜单+Enter↵同行 + 输入框 + 折叠快捷键面板），用于流式卡片
+
+    返回 list：[form, 快捷键 collapsible_panel]
+    form 包含：
+    - 行1：column_set（⚡菜单 左对齐，Enter ↵ 右对齐）
+    - 行2：input 输入框（用户直接在卡片中输入消息）
+    快捷键面板（默认折叠）：5 个键（↑ ↓ Ctrl+O Shift+Tab ESC，Enter 已提升到菜单行）
+    """
+    menu_enter_row = {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "auto",
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "⚡ 菜单"},
+                    "type": "default",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}]
+                }]
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{"tag": "markdown", "content": " "}]
+            },
+            {
+                "tag": "column",
+                "width": "auto",
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "Enter ↵"},
+                    "type": "primary",
+                    "action_type": "form_submit",
+                }]
+            },
+        ]
+    }
+
+    input_box = {
+        "tag": "input",
+        "name": "command",
+        "placeholder": {"tag": "plain_text", "content": "输入消息..."},
+        "width": "fill",
+    }
+
+    form = {
+        "tag": "form",
+        "name": "claude_input",
+        "elements": [menu_enter_row, input_box],
+    }
+
+    shortcut_keys = [
         ("↑", {"action": "send_key", "key": "up"}),
         ("↓", {"action": "send_key", "key": "down"}),
-        ("Enter", {"action": "send_key", "key": "enter"}),
         ("Ctrl+O", {"action": "send_key", "key": "ctrl_o"}),
         ("Shift+Tab", {"action": "send_key", "key": "shift_tab"}),
         ("ESC", {"action": "send_key", "key": "esc"}),
     ]
-    columns = []
-    for label, value in buttons:
-        columns.append({
+
+    def _make_key_column(label, value):
+        return {
             "tag": "column",
-            "width": "auto",
+            "width": "weighted",
+            "weight": 1,
             "elements": [{
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": label},
                 "type": "default",
+                "width": "fill",
                 "behaviors": [{"type": "callback", "value": value}]
             }]
-        })
-    return {
+        }
+
+    row1 = {
         "tag": "column_set",
         "flex_mode": "none",
-        "columns": columns,
+        "columns": [_make_key_column(l, v) for l, v in shortcut_keys[:3]],
     }
+    row2 = {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [_make_key_column(l, v) for l, v in shortcut_keys[3:]],
+    }
+
+    collapsible = {
+        "tag": "collapsible_panel",
+        "expanded": False,
+        "header": {
+            "title": {"tag": "plain_text", "content": "⌨️ 快捷键"},
+        },
+        "elements": [row1, row2],
+    }
+
+    return [form, collapsible]
 
 
 def _build_menu_button_only() -> Dict[str, Any]:
@@ -238,8 +308,8 @@ def _build_menu_button_only() -> Dict[str, Any]:
 
 
 def _build_buttons_v2(options: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    """Schema 2.0 按钮组：每行最多 4 个，超出时自动分多行"""
-    MAX_PER_ROW = 4
+    """Schema 2.0 按钮组：每行最多 3 个，超出时自动分多行"""
+    MAX_PER_ROW = 3
     total = len(options)
     rows = []
     for row_start in range(0, total, MAX_PER_ROW):
@@ -543,7 +613,7 @@ def build_stream_card(
 
     # === 第四层：菜单按钮 ===
     elements.append({"tag": "hr"})
-    elements.append(_build_menu_button_row())
+    elements.extend(_build_menu_button_row())
 
     _cb_logger.debug(
         f"build_stream_card: blocks={len(blocks)} frozen={is_frozen} "

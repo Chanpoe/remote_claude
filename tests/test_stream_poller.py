@@ -418,9 +418,12 @@ class TestBuildStreamCard(unittest.TestCase):
         self.assertIn("会话记录", card["header"]["title"]["content"])
         # 冻结卡片无状态区和按钮区
         elements = card["body"]["elements"]
-        # 不应有 column_set（除了菜单）
+        # 菜单行现在在 form 里，顶层应无裸 column_set
         col_sets = [e for e in elements if e.get("tag") == "column_set"]
-        self.assertEqual(len(col_sets), 1)  # 只有菜单按钮
+        self.assertEqual(len(col_sets), 0)  # 菜单已移入 form，无裸 column_set
+        # 应有 form 元素（菜单 + 输入框）
+        forms = [e for e in elements if e.get("tag") == "form"]
+        self.assertEqual(len(forms), 1)
 
     def test_with_status_line(self):
         blocks = [{"_type": "OutputBlock", "content": "text", "indicator": "●", "is_streaming": True}]
@@ -460,9 +463,9 @@ class TestBuildStreamCard(unittest.TestCase):
         card = build_stream_card(blocks)
         self.assertEqual(card["header"]["template"], "blue")
         elements = card["body"]["elements"]
-        # 应有按钮行（column_set，不含菜单按钮）
+        # 应有按钮行（column_set，菜单已移入 form）
         col_sets = [e for e in elements if e.get("tag") == "column_set"]
-        self.assertGreaterEqual(len(col_sets), 2)  # 至少 1 按钮行 + 1 菜单行
+        self.assertGreaterEqual(len(col_sets), 1)  # 至少 1 按钮行（菜单在 form 中）
 
     def test_with_permission_buttons(self):
         """向后兼容：blocks 中的 PermissionBlock"""
@@ -557,17 +560,27 @@ class TestBuildStreamCard(unittest.TestCase):
                                 button_sets.append(e)
         self.assertGreaterEqual(len(button_sets), 1)
 
-        # 第四层：菜单按钮
+        # 第四层：菜单按钮（现在在 form > column_set 内）
+        def _find_menu_open(column_set_elements):
+            for col in column_set_elements:
+                for el in col.get("elements", []):
+                    behaviors = el.get("behaviors", [])
+                    for b in behaviors:
+                        if b.get("value", {}).get("action") == "menu_open":
+                            return True
+            return False
+
         menu_found = False
         for e in elements:
             if e.get("tag") == "column_set":
-                for col in e.get("columns", []):
-                    for el in col.get("elements", []):
-                        if el.get("tag") == "button":
-                            behaviors = el.get("behaviors", [])
-                            for b in behaviors:
-                                if b.get("value", {}).get("action") == "menu_open":
-                                    menu_found = True
+                if _find_menu_open(e.get("columns", [])):
+                    menu_found = True
+            elif e.get("tag") == "form":
+                # 菜单行现在在 form 的第一个 element（column_set）内
+                for form_el in e.get("elements", []):
+                    if form_el.get("tag") == "column_set":
+                        if _find_menu_open(form_el.get("columns", [])):
+                            menu_found = True
         self.assertTrue(menu_found)
 
     def test_with_agent_panel_summary(self):

@@ -71,36 +71,70 @@ check_uv() {
     fi
 }
 
-# 检查并安装 tmux
+# 检查并安装 tmux（要求 3.6+）
 check_tmux() {
     print_header "检查 tmux"
 
+    REQUIRED_MAJOR=3
+    REQUIRED_MINOR=6
+
+    install_tmux() {
+        if [[ "$OS" == "Darwin" ]]; then
+            if ! command -v brew &> /dev/null; then
+                print_error "未找到 Homebrew，请先安装: https://brew.sh"
+                exit 1
+            fi
+            brew install tmux
+        elif [[ "$OS" == "Linux" ]]; then
+            if command -v apt-get &> /dev/null; then
+                sudo apt-get update && sudo apt-get install -y tmux
+            elif command -v yum &> /dev/null; then
+                sudo yum install -y tmux
+            else
+                print_error "无法自动安装 tmux，请手动安装 3.6 或更高版本"
+                exit 1
+            fi
+        fi
+        print_success "tmux 安装成功"
+    }
+
+    check_version() {
+        # tmux -V 输出格式：tmux 3.6 或 tmux 3.4a
+        local ver_str
+        ver_str=$(tmux -V | awk '{print $2}')
+        local major minor
+        major=$(echo "$ver_str" | cut -d. -f1)
+        minor=$(echo "$ver_str" | cut -d. -f2 | tr -dc '0-9')
+        if [[ "$major" -gt "$REQUIRED_MAJOR" ]] || \
+           [[ "$major" -eq "$REQUIRED_MAJOR" && "${minor:-0}" -ge "$REQUIRED_MINOR" ]]; then
+            return 0
+        fi
+        return 1
+    }
+
     if command -v tmux &> /dev/null; then
         TMUX_VERSION=$(tmux -V)
-        print_success "$TMUX_VERSION 已安装"
-        return
-    fi
-
-    print_warning "未找到 tmux，正在安装..."
-
-    if [[ "$OS" == "Darwin" ]]; then
-        if ! command -v brew &> /dev/null; then
-            print_error "未找到 Homebrew，请先安装: https://brew.sh"
-            exit 1
-        fi
-        brew install tmux
-    elif [[ "$OS" == "Linux" ]]; then
-        if command -v apt-get &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y tmux
-        elif command -v yum &> /dev/null; then
-            sudo yum install -y tmux
+        if check_version; then
+            print_success "$TMUX_VERSION 已安装（满足 >= ${REQUIRED_MAJOR}.${REQUIRED_MINOR}）"
+            return
         else
-            print_error "无法自动安装 tmux，请手动安装"
+            print_warning "$TMUX_VERSION 版本过低，需要 ${REQUIRED_MAJOR}.${REQUIRED_MINOR} 或更高，正在升级..."
+            install_tmux
+            # 升级后再次验证
+            if ! check_version; then
+                print_error "升级后版本仍不满足要求（$(tmux -V)），请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
+                exit 1
+            fi
+            print_success "tmux 已升级至 $(tmux -V)"
+        fi
+    else
+        print_warning "未找到 tmux，正在安装..."
+        install_tmux
+        if ! check_version; then
+            print_error "安装的版本不满足要求（$(tmux -V)），请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"
             exit 1
         fi
     fi
-
-    print_success "tmux 安装成功"
 }
 
 # 检查 Claude CLI
@@ -198,66 +232,52 @@ set_permissions() {
     print_success "已设置执行权限"
 }
 
-# 运行测试
-run_tests() {
-    print_header "运行测试"
-
-    read -p "$(echo -e ${YELLOW}是否运行单元测试？${NC} [y/N]: )" -n 1 -r
-    echo
-
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        if [ -f "tests/test_format_unit.py" ]; then
-            print_info "运行格式化单元测试..."
-            uv run python3 tests/test_format_unit.py
-            print_success "测试通过"
-        else
-            print_warning "未找到测试文件，跳过"
-        fi
-    fi
-}
-
-# 配置 shell 快捷命令
+# 安装快捷命令（符号链接到 bin 目录）
 configure_shell() {
-    print_header "配置 Shell 快捷命令"
+    print_header "安装快捷命令"
 
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    SHELL_RC=""
+    chmod +x "$SCRIPT_DIR/bin/cla" "$SCRIPT_DIR/bin/cl"
 
-    # 检测当前 shell
-    if [[ "$SHELL" == *"zsh"* ]]; then
-        SHELL_RC="$HOME/.zshrc"
-    elif [[ "$SHELL" == *"bash"* ]]; then
-        SHELL_RC="$HOME/.bashrc"
-    fi
+    # 优先 /usr/local/bin，权限不够降级 ~/bin
+    BIN_DIR="/usr/local/bin"
+    if ! ln -sf "$SCRIPT_DIR/bin/cla" "$BIN_DIR/cla" 2>/dev/null; then
+        BIN_DIR="$HOME/bin"
+        mkdir -p "$BIN_DIR"
+        ln -sf "$SCRIPT_DIR/bin/cla" "$BIN_DIR/cla"
+        ln -sf "$SCRIPT_DIR/bin/cl"  "$BIN_DIR/cl"
 
-    if [ -z "$SHELL_RC" ]; then
-        print_warning "未检测到 bash/zsh，请手动配置快捷命令"
-        return
-    fi
-
-    # 检查是否已配置
-    if grep -q "remote_claude.py" "$SHELL_RC" 2>/dev/null; then
-        print_info "快捷命令已配置在 $SHELL_RC 中"
-        return
-    fi
-
-    read -p "$(echo -e ${YELLOW}是否添加快捷命令到 ${SHELL_RC}？${NC} [y/N]: )" -n 1 -r
-    echo
-
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        cat >> "$SHELL_RC" << RCEOF
-
-# Remote Claude 快捷命令
-cla() { uv run --project ${SCRIPT_DIR} python3 ${SCRIPT_DIR}/remote_claude.py lark start; uv run --project ${SCRIPT_DIR} python3 ${SCRIPT_DIR}/remote_claude.py start "\${PWD}_\$(date +%m%d_%H%M%S)"; }
-cl() { uv run --project ${SCRIPT_DIR} python3 ${SCRIPT_DIR}/remote_claude.py lark start; uv run --project ${SCRIPT_DIR} python3 ${SCRIPT_DIR}/remote_claude.py start "\${PWD}_\$(date +%m%d_%H%M%S)" -- --dangerously-skip-permissions --permission-mode=dontAsk; }
-RCEOF
-        print_success "已添加快捷命令到 $SHELL_RC"
-        print_info "  cla  - 启动飞书客户端 + 以当前目录路径+时间戳为会话名启动 Claude"
-        print_info "  cl   - 同 cla，但跳过权限确认"
-        print_warning "请运行 source $SHELL_RC 或重新打开终端生效"
+        # 检查 ~/bin 是否在 PATH 中
+        if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+            print_warning "$BIN_DIR 不在 PATH 中"
+            print_info "请将以下行添加到 shell 配置文件（~/.zshrc 或 ~/.bashrc）："
+            echo "  export PATH=\"\$HOME/bin:\$PATH\""
+        fi
     else
-        print_info "跳过快捷命令配置"
+        ln -sf "$SCRIPT_DIR/bin/cl" "$BIN_DIR/cl"
     fi
+
+    print_success "已安装 cla 和 cl 到 $BIN_DIR"
+    print_info "  cla  - 启动飞书客户端 + 以当前目录路径+时间戳为会话名启动 Claude"
+    print_info "  cl   - 同 cla，但跳过权限确认"
+}
+
+# 重启飞书客户端
+restart_lark_client() {
+    print_header "重启飞书客户端"
+
+    LARK_PID_FILE="/tmp/remote-claude/lark.pid"
+
+    if [ ! -f "$LARK_PID_FILE" ] && ! pgrep -f "lark_client/main.py" &>/dev/null; then
+        print_info "飞书客户端未运行，跳过重启"
+        return
+    fi
+
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    print_info "正在重启飞书客户端..."
+    cd "$SCRIPT_DIR"
+    uv run python3 remote_claude.py lark restart
+    print_success "飞书客户端已重启"
 }
 
 # 显示使用说明
@@ -284,10 +304,10 @@ ${GREEN}快速开始：${NC}
   4. 关闭会话：
      ${BLUE}uv run python3 remote_claude.py kill <会话名>${NC}
 
-${YELLOW}快捷命令：${NC}
+${YELLOW}快捷命令（已安装到系统 bin 目录）：${NC}
 
   ${BLUE}cla${NC}  - 启动飞书客户端 + 以当前目录+时间戳为会话名启动 Claude
-  ${BLUE}cl${NC}   - 同 cla，但跳过权限确认
+  ${BLUE}cl${NC}   - 同 cla，但跳过权限确认（适合自动化/受信任场景）
 
 ${YELLOW}飞书客户端（可选）：${NC}
 
@@ -339,7 +359,7 @@ main() {
     create_directories
     set_permissions
     configure_shell
-    run_tests
+    restart_lark_client
     show_usage
 }
 

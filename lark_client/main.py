@@ -108,6 +108,20 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
             response.toast = toast
             return response
 
+        # 检测 form 提交（输入框 Enter ↵ 按钮）
+        form_value = getattr(action, 'form_value', None)
+        if form_value is not None:
+            command_text = (form_value.get("command") or "").strip()
+            print(f"[Lark] form 提交: user={user_id[:8]}..., command={command_text!r}")
+            if command_text:
+                # 有输入内容 → 当作消息处理（支持 /命令 和普通文本）
+                chat_type = getattr(context, 'chat_type', 'p2p') or 'p2p'
+                asyncio.create_task(handler.handle_message(user_id, chat_id, command_text, chat_type=chat_type))
+            else:
+                # 空输入 → 发送原始 Enter 键（用于确认默认选项等场景）
+                asyncio.create_task(handler.send_raw_key(user_id, chat_id, "enter"))
+            return None
+
         action_type = action_value.get("action", "")
 
         # 处理选项选择动作
