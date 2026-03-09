@@ -40,6 +40,65 @@ BOX_CORNER_TOP: Set[str] = {'╭', '┌'}
 BOX_CORNER_BOTTOM: Set[str] = {'╰', '└'}
 BOX_VERTICAL: Set[str] = {'│', '┃', '║'}
 
+# OutputBlock 内嵌框线清理（纯文本版，用于 content 检测）
+_INLINE_BOX_TOP_RE = re.compile(r'^\s*[╭┌][─━═╌]+[╮┐]\s*$')
+_INLINE_BOX_BOTTOM_RE = re.compile(r'^\s*[╰└][─━═╌]+[╯┘]\s*$')
+_INLINE_BOX_LEFT_RE = re.compile(r'^(\s*)[│┃║] ?')
+_INLINE_BOX_RIGHT_RE = re.compile(r'\s*[│┃║]\s*$')
+
+# ANSI 版（用于 ansi_content 清理）
+_A = r'(?:\x1b\[[\d;]*m)*'
+_ANSI_BOX_LEFT_RE = re.compile(rf'^({_A}\s*){_A}[│┃║]{_A} ?')
+_ANSI_BOX_RIGHT_RE = re.compile(rf'\s*{_A}[│┃║]{_A}\s*$')
+
+
+def _strip_inline_boxes_pair(content: str, ansi_content: str) -> tuple:
+    """去除 OutputBlock 内嵌的 box-drawing 框线，同步清理 content 和 ansi_content。
+
+    仅在检测到完整 box（顶边框 + 底边框配对）时才去除，防止误伤普通 │ 内容。
+    返回 (cleaned_content, cleaned_ansi_content)。
+    """
+    lines = content.split('\n')
+    top_stack: list = []
+    box_ranges: list = []
+    for i, line in enumerate(lines):
+        if _INLINE_BOX_TOP_RE.match(line):
+            top_stack.append(i)
+        elif _INLINE_BOX_BOTTOM_RE.match(line) and top_stack:
+            top_idx = top_stack.pop()
+            box_ranges.append((top_idx, i))
+
+    if not box_ranges:
+        return content, ansi_content
+
+    ansi_lines = ansi_content.split('\n')
+    if len(ansi_lines) != len(lines):
+        return content, ansi_content
+
+    remove_lines: set = set()
+    side_lines: set = set()
+    for top_idx, bottom_idx in box_ranges:
+        remove_lines.add(top_idx)
+        remove_lines.add(bottom_idx)
+        for j in range(top_idx + 1, bottom_idx):
+            side_lines.add(j)
+
+    result_content = []
+    result_ansi = []
+    for i, (line, aline) in enumerate(zip(lines, ansi_lines)):
+        if i in remove_lines:
+            continue
+        if i in side_lines:
+            line = _INLINE_BOX_LEFT_RE.sub(r'\1', line)
+            line = _INLINE_BOX_RIGHT_RE.sub('', line)
+            aline = _ANSI_BOX_LEFT_RE.sub(r'\1', aline)
+            aline = _ANSI_BOX_RIGHT_RE.sub('', aline)
+        result_content.append(line)
+        result_ansi.append(aline)
+
+    return '\n'.join(result_content), '\n'.join(result_ansi)
+
+
 # 编号选项行正则（权限确认对话框特征：❯ 1. Yes / 2. No 等）
 _NUMBERED_OPTION_RE = re.compile(r'^(?:❯\s*)?\d+[.)]\s+.+')
 # 带 ❯ 光标的编号选项行正则（锚点）
@@ -569,6 +628,7 @@ class ScreenParser:
             content = '\n'.join([first_content] + body_lines).rstrip()
             ansi_body_lines = [_get_row_ansi_text(screen, r) for r in block_rows[1:]]
             ansi_content = '\n'.join([cached_ansi_first] + ansi_body_lines).rstrip()
+            content, ansi_content = _strip_inline_boxes_pair(content, ansi_content)
             return OutputBlock(
                 content=content, is_streaming=cached_blink, start_row=first_row,
                 ansi_content=ansi_content, indicator=cached_ind, ansi_indicator=cached_ansi_ind,
@@ -619,6 +679,7 @@ class ScreenParser:
             body_lines = lines[1:]
             content = '\n'.join([first_content] + body_lines).rstrip()
             ansi_content = '\n'.join([ansi_first] + ansi_body).rstrip()
+            content, ansi_content = _strip_inline_boxes_pair(content, ansi_content)
             return OutputBlock(
                 content=content, is_streaming=is_blink, start_row=first_row,
                 ansi_content=ansi_content, indicator=ind, ansi_indicator=ansi_ind,

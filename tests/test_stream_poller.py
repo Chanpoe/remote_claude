@@ -840,7 +840,7 @@ class TestPollerPollOnce(unittest.TestCase):
         tracker = StreamTracker(chat_id="c1", session_name="s1")
         tracker.reader = self._make_reader({"blocks": [], "status_line": None, "bottom_bar": None})
 
-        asyncio.get_event_loop().run_until_complete(self.poller._poll_once(tracker))
+        asyncio.run(self.poller._poll_once(tracker))
 
         self.card_service.create_card.assert_not_called()
         self.assertEqual(len(tracker.cards), 0)
@@ -851,7 +851,7 @@ class TestPollerPollOnce(unittest.TestCase):
         tracker = StreamTracker(chat_id="c1", session_name="s1")
         tracker.reader = self._make_reader({"blocks": blocks, "status_line": None, "bottom_bar": None})
 
-        asyncio.get_event_loop().run_until_complete(self.poller._poll_once(tracker))
+        asyncio.run(self.poller._poll_once(tracker))
 
         self.card_service.create_card.assert_called_once()
         self.card_service.send_card.assert_called_once()
@@ -865,7 +865,7 @@ class TestPollerPollOnce(unittest.TestCase):
         tracker = StreamTracker(chat_id="c1", session_name="s1")
         tracker.reader = self._make_reader({"blocks": blocks, "status_line": None, "bottom_bar": None})
 
-        asyncio.get_event_loop().run_until_complete(self.poller._poll_once(tracker))
+        asyncio.run(self.poller._poll_once(tracker))
 
         self.assertEqual(len(tracker.cards), 1)
         self.assertEqual(tracker.cards[0].start_idx, 100 - INITIAL_WINDOW)
@@ -877,7 +877,7 @@ class TestPollerPollOnce(unittest.TestCase):
         tracker.reader = self._make_reader({"blocks": blocks_v1, "status_line": None, "bottom_bar": None})
 
         # 首次 → 创建
-        asyncio.get_event_loop().run_until_complete(self.poller._poll_once(tracker))
+        asyncio.run(self.poller._poll_once(tracker))
         self.assertEqual(self.card_service.create_card.call_count, 1)
 
         # 第二次，内容变化 → 更新
@@ -886,7 +886,7 @@ class TestPollerPollOnce(unittest.TestCase):
             {"_type": "OutputBlock", "content": "world", "indicator": "●"},
         ]
         tracker.reader = self._make_reader({"blocks": blocks_v2, "status_line": None, "bottom_bar": None})
-        asyncio.get_event_loop().run_until_complete(self.poller._poll_once(tracker))
+        asyncio.run(self.poller._poll_once(tracker))
 
         self.card_service.update_card.assert_called_once()
         self.assertEqual(tracker.cards[0].sequence, 1)
@@ -898,10 +898,10 @@ class TestPollerPollOnce(unittest.TestCase):
         tracker.reader = self._make_reader({"blocks": blocks, "status_line": None, "bottom_bar": None})
 
         # 首次 → 创建
-        asyncio.get_event_loop().run_until_complete(self.poller._poll_once(tracker))
+        asyncio.run(self.poller._poll_once(tracker))
 
         # 第二次，内容不变 → 跳过
-        asyncio.get_event_loop().run_until_complete(self.poller._poll_once(tracker))
+        asyncio.run(self.poller._poll_once(tracker))
 
         self.card_service.update_card.assert_not_called()
 
@@ -913,14 +913,14 @@ class TestPollerPollOnce(unittest.TestCase):
         tracker.reader = self._make_reader({"blocks": blocks[:5], "status_line": None, "bottom_bar": None})
 
         # 首次：创建卡片（5 个 blocks）
-        asyncio.get_event_loop().run_until_complete(self.poller._poll_once(tracker))
+        asyncio.run(self.poller._poll_once(tracker))
         self.assertEqual(len(tracker.cards), 1)
         self.assertEqual(tracker.cards[0].start_idx, 0)
 
         # 现在 blocks 增长到超限
         self.card_service.create_card = AsyncMock(return_value="card_002")
         tracker.reader = self._make_reader({"blocks": blocks, "status_line": None, "bottom_bar": None})
-        asyncio.get_event_loop().run_until_complete(self.poller._poll_once(tracker))
+        asyncio.run(self.poller._poll_once(tracker))
 
         # 应该冻结第一张 + 创建第二张
         self.assertEqual(len(tracker.cards), 2)
@@ -935,7 +935,7 @@ class TestPollerPollOnce(unittest.TestCase):
         tracker.reader = self._make_reader({"blocks": blocks, "status_line": None, "bottom_bar": None})
 
         # 首次 → 创建
-        asyncio.get_event_loop().run_until_complete(self.poller._poll_once(tracker))
+        asyncio.run(self.poller._poll_once(tracker))
 
         # 第二次 → update 失败，降级创建
         blocks_v2 = [
@@ -946,7 +946,7 @@ class TestPollerPollOnce(unittest.TestCase):
         self.card_service.update_card = AsyncMock(return_value=False)
         self.card_service.create_card = AsyncMock(return_value="card_fallback")
 
-        asyncio.get_event_loop().run_until_complete(self.poller._poll_once(tracker))
+        asyncio.run(self.poller._poll_once(tracker))
 
         # 降级创建了新卡片
         self.assertEqual(tracker.cards[0].card_id, "card_fallback")
@@ -969,7 +969,7 @@ class TestPollerStartStop(unittest.TestCase):
             self.assertNotIn("chat_1", poller._trackers)
             self.assertNotIn("chat_1", poller._tasks)
 
-        asyncio.get_event_loop().run_until_complete(_run())
+        asyncio.run(_run())
 
     def test_start_replaces_old(self):
         async def _run():
@@ -987,7 +987,7 @@ class TestPollerStartStop(unittest.TestCase):
 
             poller.stop("chat_1")
 
-        asyncio.get_event_loop().run_until_complete(_run())
+        asyncio.run(_run())
 
 
 class TestComputeHash(unittest.TestCase):

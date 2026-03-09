@@ -1710,6 +1710,145 @@ class TestPlanBlockParser:
         return self.failed == 0
 
 
+class TestInlineBoxStripper:
+    """OutputBlock 内嵌框线去除测试（server 端 _strip_inline_boxes_pair）"""
+
+    def __init__(self):
+        self.passed = 0
+        self.failed = 0
+        self.errors = []
+
+    def _pass(self, name):
+        self.passed += 1
+        print(f"  ✓ {name}")
+
+    def _fail(self, name, msg=""):
+        self.failed += 1
+        self.errors.append(f"{name}: {msg}")
+        print(f"  ✗ {name}: {msg}")
+
+    def _get_strip_fn(self):
+        sys.path.insert(0, str(Path(__file__).parent.parent / 'server'))
+        from component_parser import _strip_inline_boxes_pair
+        return _strip_inline_boxes_pair
+
+    def _make_parser_and_screen(self, text, cols=220, lines=50):
+        sys.path.insert(0, str(Path(__file__).parent.parent / 'server'))
+        from component_parser import ScreenParser
+        screen = pyte.Screen(cols, lines)
+        stream = pyte.Stream(screen)
+        stream.feed(text)
+        parser = ScreenParser()
+        return parser, screen
+
+    def test_inline_box_stripped(self):
+        """content 含完整 box → 边框删除，框内文本保留"""
+        _strip_inline_boxes_pair = self._get_strip_fn()
+        content = "\n".join([
+            "User rejected Claude's plan:",
+            "   ╭─────────────────────────────────╮",
+            "   │ 计算今年有几个星期               │",
+            "   │ Context                         │",
+            "   │ ...                             │",
+            "   ╰─────────────────────────────────╯",
+        ])
+        ansi_content = content  # 纯文本场景 ansi 与 content 相同
+        result_c, result_a = _strip_inline_boxes_pair(content, ansi_content)
+        if "╭" in result_c:
+            self._fail("inline_box_stripped", "顶边框应被删除")
+            return
+        if "╰" in result_c:
+            self._fail("inline_box_stripped", "底边框应被删除")
+            return
+        if "计算今年有几个星期" not in result_c:
+            self._fail("inline_box_stripped", "框内文本应保留")
+            return
+        if "│" in result_c:
+            self._fail("inline_box_stripped", "竖线边框应被去除")
+            return
+        self._pass("inline_box_stripped")
+
+    def test_incomplete_box_preserved(self):
+        """只有顶框无底框 → 原样保留，不误删"""
+        _strip_inline_boxes_pair = self._get_strip_fn()
+        content = "\n".join([
+            "some text",
+            "╭─────────────────╮",
+            "│ partial content │",
+            "no closing border here",
+        ])
+        result_c, result_a = _strip_inline_boxes_pair(content, content)
+        if "╭" not in result_c:
+            self._fail("incomplete_box_preserved", "不完整 box 应原样保留（╭ 丢失）")
+            return
+        if "partial content" not in result_c:
+            self._fail("incomplete_box_preserved", "内容应保留")
+            return
+        self._pass("incomplete_box_preserved")
+
+    def test_strip_inline_boxes_pair_direct(self):
+        """直接测试函数：content 和 ansi_content 同步清理"""
+        _strip_inline_boxes_pair = self._get_strip_fn()
+        content = "\n".join([
+            "before",
+            "╭────╮",
+            "│ hi │",
+            "╰────╯",
+            "after",
+        ])
+        ansi_content = "\n".join([
+            "before",
+            "\x1b[90m╭────╮\x1b[0m",
+            "\x1b[90m│\x1b[0m hi \x1b[90m│\x1b[0m",
+            "\x1b[90m╰────╯\x1b[0m",
+            "after",
+        ])
+        result_c, result_a = _strip_inline_boxes_pair(content, ansi_content)
+        # content 清理正确
+        if "╭" in result_c or "╰" in result_c:
+            self._fail("strip_pair_direct", "content 边框行应被删除")
+            return
+        if "hi" not in result_c:
+            self._fail("strip_pair_direct", "content 框内文本应保留")
+            return
+        # ansi_content 同步清理（行数相同）
+        a_lines = result_a.split('\n')
+        c_lines = result_c.split('\n')
+        if len(a_lines) != len(c_lines):
+            self._fail("strip_pair_direct", f"ansi_content 行数({len(a_lines)}) 与 content 行数({len(c_lines)}) 不一致")
+            return
+        self._pass("strip_pair_direct")
+
+    def run_all(self):
+        """运行所有内嵌框线去除测试"""
+        print()
+        print("=" * 60)
+        print("OutputBlock 内嵌框线去除测试（_strip_inline_boxes_pair）")
+        print("=" * 60)
+
+        tests = [
+            self.test_inline_box_stripped,
+            self.test_incomplete_box_preserved,
+            self.test_strip_inline_boxes_pair_direct,
+        ]
+
+        for test in tests:
+            try:
+                test()
+            except Exception as e:
+                import traceback
+                self._fail(test.__name__, f"异常: {e}\n{traceback.format_exc()}")
+
+        print()
+        print(f"结果: {self.passed} 通过, {self.failed} 失败, 共 {self.passed + self.failed} 个测试")
+        if self.errors:
+            print(f"\n失败详情:")
+            for err in self.errors:
+                print(f"  - {err}")
+
+        return self.failed == 0
+
+
 if __name__ == "__main__":
     # 运行旧版测试（可能因 import 路径问题跳过）
     success1 = True
@@ -1735,4 +1874,8 @@ if __name__ == "__main__":
     runner4 = TestPlanBlockParser()
     success4 = runner4.run_all()
 
-    sys.exit(0 if (success1 and success2 and success3 and success4) else 1)
+    # 运行内嵌框线去除测试
+    runner5 = TestInlineBoxStripper()
+    success5 = runner5.run_all()
+
+    sys.exit(0 if (success1 and success2 and success3 and success4 and success5) else 1)

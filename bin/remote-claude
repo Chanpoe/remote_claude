@@ -13,6 +13,31 @@ if ! command -v uv &>/dev/null; then
     [ -f "$HOME/.local/bin/uv" ] && export PATH="$HOME/.local/bin:$PATH"
 fi
 
+# log 子命令：查看最后启动的 session 日志
+if [ "$1" = "log" ]; then
+    LOG_DIR="/tmp/remote-claude"
+    if [ -n "$2" ]; then
+        # 指定 session 名，/ 和 . 替换为 _（与 _safe_filename 一致）
+        SESSION_SAFE=$(echo "$2" | tr '/.' '__')
+        LOG_FILE="$LOG_DIR/${SESSION_SAFE}_messages.log"
+    else
+        # 找最后启动的 session（最新的 session .pid 文件，排除 lark.pid）
+        LATEST_PID=$(ls -t "$LOG_DIR"/_*.pid 2>/dev/null | head -1)
+        if [ -n "$LATEST_PID" ]; then
+            SESSION_SAFE=$(basename "$LATEST_PID" .pid)
+            LOG_FILE="$LOG_DIR/${SESSION_SAFE}_messages.log"
+        fi
+    fi
+
+    if [ -z "$LOG_FILE" ] || [ ! -f "$LOG_FILE" ]; then
+        echo "没有找到日志文件（请先启动一个会话）" >&2
+        exit 1
+    fi
+
+    echo "📄 $LOG_FILE"
+    exec tail -50f "$LOG_FILE"
+fi
+
 # lark 子命令：检查 .env 配置
 if [ "$1" = "lark" ]; then
     source "$INSTALL_DIR/scripts/check-env.sh" "$INSTALL_DIR"
