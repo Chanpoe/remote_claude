@@ -37,7 +37,7 @@ except Exception:
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 INITIAL_WINDOW = 30    # 首次 attach 最多显示最近 30 个 blocks
-MAX_CARD_BLOCKS = 50   # 单张卡片最多 50 个 blocks → 超限冻结
+from .config import MAX_CARD_BLOCKS  # 单张卡片最多 N 个 blocks → 超限冻结（可通过 .env 配置）
 POLL_INTERVAL = 1.0    # 轮询间隔（秒）
 RAPID_INTERVAL = 0.2   # 快速轮询间隔（秒）
 RAPID_DURATION = 2.0   # 快速轮询持续时间（秒）
@@ -210,6 +210,7 @@ class SharedMemoryPoller:
         bottom_bar = state.get("bottom_bar")
         agent_panel = state.get("agent_panel")
         option_block = state.get("option_block")
+        cli_type = state.get("cli_type", "claude")
 
         # 获取活跃卡片（最后一张且未冻结）
         active = None
@@ -221,14 +222,24 @@ class SharedMemoryPoller:
 
         if active is None:
             # 需要创建新卡片
-            await self._create_new_card(tracker, blocks, status_line, bottom_bar, agent_panel, option_block)
+            await self._create_new_card(tracker, blocks, status_line, bottom_bar, agent_panel, option_block, cli_type=cli_type)
         else:
             # 有活跃卡片，检查是否需要更新
             blocks_slice = blocks[active.start_idx:]
 
+            # blocks 骤降检测（compact/重启导致 blocks 从头累积）
+            if len(blocks) < active.start_idx:
+                logger.warning(
+                    f"[blocks regression] len(blocks)={len(blocks)} < start_idx={active.start_idx}, "
+                    f"resetting start_idx to 0 (session={tracker.session_name})"
+                )
+                active.start_idx = 0
+                blocks_slice = blocks[0:]
+                tracker.content_hash = ""  # 强制刷新
+
             # 超限检查
             if len(blocks_slice) > MAX_CARD_BLOCKS:
-                await self._freeze_and_split(tracker, blocks, status_line, bottom_bar, agent_panel, option_block)
+                await self._freeze_and_split(tracker, blocks, status_line, bottom_bar, agent_panel, option_block, cli_type=cli_type)
                 return
 
             # hash diff
@@ -238,7 +249,7 @@ class SharedMemoryPoller:
 
             # 更新卡片
             from .card_builder import build_stream_card
-            card_dict = build_stream_card(blocks_slice, status_line, bottom_bar, agent_panel=agent_panel, option_block=option_block, session_name=tracker.session_name)
+            card_dict = build_stream_card(blocks_slice, status_line, bottom_bar, agent_panel=agent_panel, option_block=option_block, session_name=tracker.session_name, cli_type=cli_type)
 
             active.sequence += 1
             success = await self._card_service.update_card(
@@ -250,7 +261,8 @@ class SharedMemoryPoller:
             if getattr(success, 'is_element_limit', False):
                 # 元素超限：冻结旧卡 + 推新流式卡
                 await self._handle_element_limit(
-                    tracker, blocks, status_line, bottom_bar, agent_panel, option_block
+                    tracker, blocks, status_line, bottom_bar, agent_panel, option_block,
+                    cli_type=cli_type,
                 )
                 return
             elif not success:
@@ -280,6 +292,7 @@ class SharedMemoryPoller:
         status_line: Optional[dict], bottom_bar: Optional[dict],
         agent_panel: Optional[dict] = None,
         option_block: Optional[dict] = None,
+        cli_type: str = "claude",
     ) -> None:
         """创建新卡片（首次 attach 或冻结后）"""
         if not tracker.cards:
@@ -289,13 +302,19 @@ class SharedMemoryPoller:
             # 冻结后：从上张冻结卡片的结束位置开始
             last_frozen = tracker.cards[-1]
             start_idx = last_frozen.start_idx + MAX_CARD_BLOCKS
+            if start_idx >= len(blocks):
+                start_idx = 0
+                logger.warning(
+                    f"[_create_new_card] start_idx overflow, reset to 0 "
+                    f"(frozen.start_idx={last_frozen.start_idx}, total blocks={len(blocks)})"
+                )
 
         blocks_slice = blocks[start_idx:]
         if not blocks_slice and not status_line and not bottom_bar and not agent_panel and not option_block:
             return
 
         from .card_builder import build_stream_card
-        card_dict = build_stream_card(blocks_slice, status_line, bottom_bar, agent_panel=agent_panel, option_block=option_block, session_name=tracker.session_name)
+        card_dict = build_stream_card(blocks_slice, status_line, bottom_bar, agent_panel=agent_panel, option_block=option_block, session_name=tracker.session_name, cli_type=cli_type)
         card_id = await self._card_service.create_card(card_dict)
 
         if card_id:
@@ -316,6 +335,7 @@ class SharedMemoryPoller:
         status_line: Optional[dict], bottom_bar: Optional[dict],
         agent_panel: Optional[dict] = None,
         option_block: Optional[dict] = None,
+        cli_type: str = "claude",
     ) -> None:
         """元素超限：冻结旧卡片 + 推送新流式卡片"""
         active = tracker.cards[-1]
@@ -340,6 +360,7 @@ class SharedMemoryPoller:
             new_blocks, status_line, bottom_bar,
             agent_panel=agent_panel, option_block=option_block,
             session_name=tracker.session_name,
+            cli_type=cli_type,
         )
         new_card_id = await self._card_service.create_card(new_card_dict)
         if new_card_id:
@@ -358,6 +379,7 @@ class SharedMemoryPoller:
         status_line: Optional[dict], bottom_bar: Optional[dict],
         agent_panel: Optional[dict] = None,
         option_block: Optional[dict] = None,
+        cli_type: str = "claude",
     ) -> None:
         """冻结当前卡片 + 开新卡"""
         active = tracker.cards[-1]
@@ -382,7 +404,7 @@ class SharedMemoryPoller:
         if not new_blocks:
             return
 
-        new_card_dict = build_stream_card(new_blocks, status_line, bottom_bar, agent_panel=agent_panel, option_block=option_block, session_name=tracker.session_name)
+        new_card_dict = build_stream_card(new_blocks, status_line, bottom_bar, agent_panel=agent_panel, option_block=option_block, session_name=tracker.session_name, cli_type=cli_type)
         new_card_id = await self._card_service.create_card(new_card_dict)
         if new_card_id:
             await self._card_service.send_card(tracker.chat_id, new_card_id)

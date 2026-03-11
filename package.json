@@ -24,7 +24,6 @@
     "stats/__init__.py",
     "stats/*.py",
     "pyproject.toml",
-    "uv.lock",
     ".env.example"
   ],
   "os": [

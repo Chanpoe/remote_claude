@@ -17,6 +17,12 @@ from typing import Dict, Any, List, Optional
 
 _cb_logger = logging.getLogger('CardBuilder')
 
+# CLI 类型 → 显示名称映射（用于卡片标题中的"就绪"文案）
+CLI_NAMES: Dict[str, str] = {
+    "claude": "Claude",
+    "codex": "Codex",
+}
+
 # 版本号：从 package.json 读取，import 时只读一次
 try:
     _pkg = _pl.Path(__file__).parent.parent / "package.json"
@@ -539,6 +545,17 @@ def _render_block_colored(block_dict: dict) -> Optional[str]:
             parts.append("🔐 权限确认")
         return "\n".join(parts)
 
+    elif typ == "SystemBlock":
+        content = block_dict.get("content", "")
+        if not content:
+            return None
+        ansi_content = block_dict.get("ansi_content", "")
+        ansi_ind = block_dict.get("ansi_indicator", "")
+        indicator = block_dict.get("indicator", "✻")
+        ind_md = _ansi_to_lark_md(ansi_ind) if ansi_ind else _escape_md(indicator)
+        content_md = _ansi_to_lark_md(ansi_content) if ansi_content else _escape_md(content)
+        return f"{ind_md} {content_md}"
+
     return None
 
 
@@ -565,6 +582,7 @@ def _determine_header(
     is_frozen: bool,
     option_block: Optional[dict] = None,
     disconnected: bool = False,
+    cli_type: str = "claude",
 ) -> tuple:
     """确定卡片标题和颜色模板，返回 (title, template)"""
     if disconnected:
@@ -601,7 +619,8 @@ def _determine_header(
             return "🔐 等待权限确认", "red"
         return "🤔 等待选择", "blue"
 
-    return "✅ Claude 就绪", "green"
+    cli_name = CLI_NAMES.get(cli_type, "Claude")
+    return f"✅ {cli_name} 就绪", "green"
 
 
 def _extract_buttons(blocks: List[dict], option_block: Optional[dict] = None) -> List[Dict[str, str]]:
@@ -626,6 +645,7 @@ def build_stream_card(
     option_block: Optional[dict] = None,
     session_name: Optional[str] = None,
     disconnected: bool = False,
+    cli_type: str = "claude",
 ) -> Dict[str, Any]:
     """从共享内存 blocks 流构建飞书卡片
 
@@ -637,7 +657,8 @@ def build_stream_card(
     """
     title, template = _determine_header(
         blocks, status_line, bottom_bar, is_frozen,
-        option_block=option_block, disconnected=disconnected
+        option_block=option_block, disconnected=disconnected,
+        cli_type=cli_type,
     )
 
     # === 第一层：内容区 ===
@@ -749,12 +770,17 @@ def build_stream_card(
 
 # === 辅助卡片（保留不变）===
 
-def _build_session_list_elements(sessions: List[Dict], current_session: Optional[str], session_groups: Optional[Dict[str, str]]) -> List[Dict]:
+def _build_session_list_elements(sessions: List[Dict], current_session: Optional[str], session_groups: Optional[Dict[str, str]], page: int = 0) -> List[Dict]:
     """构建会话列表元素（供 build_menu_card 复用）"""
     import os
     elements = []
     if sessions:
-        for s in sessions:
+        PER_PAGE = 8
+        total = len(sessions)
+        total_pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, total_pages - 1))
+        shown = sessions[page * PER_PAGE : (page + 1) * PER_PAGE]
+        for s in shown:
             name = s["name"]
             cwd = s.get("cwd", "")
             start_time = s.get("start_time", "")
@@ -846,6 +872,41 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
 
         if elements and elements[-1].get("tag") == "hr":
             elements.pop()
+
+        if total > PER_PAGE:
+            prev_disabled = page == 0
+            next_disabled = page >= total_pages - 1
+            prev_btn = {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "⬅ 上一页"},
+                "type": "default",
+                **({"disabled": True} if prev_disabled else {"behaviors": [{"type": "callback", "value": {
+                    "action": "menu_page", "page": page - 1
+                }}]})
+            }
+            next_btn = {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "下一页 ➡"},
+                "type": "default",
+                **({"disabled": True} if next_disabled else {"behaviors": [{"type": "callback", "value": {
+                    "action": "menu_page", "page": page + 1
+                }}]})
+            }
+            elements.append({"tag": "hr"})
+            elements.append({
+                "tag": "column_set",
+                "flex_mode": "none",
+                "horizontal_spacing": "small",
+                "columns": [
+                    {"tag": "column", "width": "weighted", "weight": 1, "elements": [{"tag": "markdown", "content": " "}]},
+                    {"tag": "column", "width": "auto", "elements": [prev_btn]},
+                    {"tag": "column", "width": "auto", "vertical_align": "center", "elements": [
+                        {"tag": "markdown", "content": f"第 {page + 1}/{total_pages} 页"}
+                    ]},
+                    {"tag": "column", "width": "auto", "elements": [next_btn]},
+                    {"tag": "column", "width": "weighted", "weight": 1, "elements": [{"tag": "markdown", "content": " "}]},
+                ]
+            })
     else:
         elements.append({
             "tag": "markdown",
@@ -1001,41 +1062,38 @@ def build_dir_card(target, entries: List[Dict], sessions: List[Dict], tree: bool
             elements.append({"tag": "markdown", "content": f"{indent}{icon} {name}"})
 
     if not tree and total > PER_PAGE:
-        page_cols = []
-        if page > 0:
-            page_cols.append({
-                "tag": "column",
-                "width": "auto",
-                "elements": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "⬅️ 上一页"},
-                    "type": "default",
-                    "behaviors": [{"type": "callback", "value": {
-                        "action": "dir_page", "path": target_str, "page": page - 1
-                    }}]
-                }]
-            })
-        page_cols.append({
-            "tag": "column",
-            "width": "weighted",
-            "weight": 2,
-            "vertical_align": "center",
-            "elements": [{"tag": "markdown", "content": f"第 {page + 1}/{total_pages} 页"}]
+        prev_disabled = page == 0
+        next_disabled = page >= total_pages - 1
+        prev_btn = {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "⬅ 上一页"},
+            "type": "default",
+            **({"disabled": True} if prev_disabled else {"behaviors": [{"type": "callback", "value": {
+                "action": "dir_page", "path": target_str, "page": page - 1
+            }}]})
+        }
+        next_btn = {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "下一页 ➡"},
+            "type": "default",
+            **({"disabled": True} if next_disabled else {"behaviors": [{"type": "callback", "value": {
+                "action": "dir_page", "path": target_str, "page": page + 1
+            }}]})
+        }
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "horizontal_spacing": "small",
+            "columns": [
+                {"tag": "column", "width": "weighted", "weight": 1, "elements": [{"tag": "markdown", "content": " "}]},
+                {"tag": "column", "width": "auto", "elements": [prev_btn]},
+                {"tag": "column", "width": "auto", "vertical_align": "center", "elements": [
+                    {"tag": "markdown", "content": f"第 {page + 1}/{total_pages} 页"}
+                ]},
+                {"tag": "column", "width": "auto", "elements": [next_btn]},
+                {"tag": "column", "width": "weighted", "weight": 1, "elements": [{"tag": "markdown", "content": " "}]},
+            ]
         })
-        if page < total_pages - 1:
-            page_cols.append({
-                "tag": "column",
-                "width": "auto",
-                "elements": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "下一页 ➡️"},
-                    "type": "default",
-                    "behaviors": [{"type": "callback", "value": {
-                        "action": "dir_page", "path": target_str, "page": page + 1
-                    }}]
-                }]
-            })
-        elements.append({"tag": "column_set", "flex_mode": "none", "columns": page_cols})
 
     elements.append({"tag": "hr"})
     elements.append(_build_menu_button_only())
@@ -1124,12 +1182,13 @@ def build_session_closed_card(session_name: str) -> Dict[str, Any]:
 
 
 def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
-                    session_groups: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+                    session_groups: Optional[Dict[str, str]] = None, page: int = 0) -> Dict[str, Any]:
     """构建快捷操作菜单卡片（/menu 和 /list 共用）：内嵌会话列表 + 快捷操作"""
     elements = []
 
     elements.append({"tag": "markdown", "content": "**会话管理**"})
-    elements.extend(_build_session_list_elements(sessions, current_session, session_groups))
+    elements.append({"tag": "hr"})
+    elements.extend(_build_session_list_elements(sessions, current_session, session_groups, page=page))
 
     elements.append({"tag": "hr"})
     elements.append({"tag": "markdown", "content": "**快捷操作**"})
@@ -1157,6 +1216,17 @@ def build_menu_card(sessions: List[Dict], current_session: Optional[str] = None,
                     "text": {"tag": "plain_text", "content": "🌲 目录树"},
                     "type": "default",
                     "behaviors": [{"type": "callback", "value": {"action": "menu_tree"}}]
+                }]
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "🔄 刷新"},
+                    "type": "default",
+                    "behaviors": [{"type": "callback", "value": {"action": "menu_open"}}]
                 }]
             },
         ]

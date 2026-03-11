@@ -103,7 +103,13 @@ class LarkHandler:
         except Exception as e:
             logger.warning(f"保存群聊 ID 失败: {e}")
 
-    def _remove_binding_by_chat(self, chat_id: str):
+    def _remove_binding_by_chat(self, chat_id: str, force: bool = False):
+        """移除 chat_id 的绑定。
+        群聊绑定默认不移除（避免断开后无法解散群）；
+        force=True 时强制移除（用于会话终止/解散群场景）。
+        """
+        if not force and chat_id in self._group_chat_ids:
+            return
         self._chat_bindings.pop(chat_id, None)
         self._save_chat_bindings()
 
@@ -416,7 +422,14 @@ class LarkHandler:
                 if active_slice:
                     await self._update_card_disconnected(cid, sname, active_slice)
                 await self._detach(cid)
-                self._remove_binding_by_chat(cid)
+                self._remove_binding_by_chat(cid, force=True)
+
+        # 清理所有残留绑定（包括已断开的群聊，其绑定在断开时被保留）
+        for cid in [c for c, s in list(self._chat_bindings.items()) if s == session_name]:
+            self._group_chat_ids.discard(cid)
+            self._chat_bindings.pop(cid, None)
+        self._save_chat_bindings()
+        self._save_group_chat_ids()
 
         if tmux_session_exists(session_name):
             tmux_kill_session(session_name)
@@ -542,7 +555,7 @@ class LarkHandler:
         await self._send_or_update_card(chat_id, card, message_id)
 
     async def _cmd_menu(self, user_id: str, chat_id: str,
-                         message_id: Optional[str] = None):
+                         message_id: Optional[str] = None, page: int = 0):
         """显示快捷操作菜单（内嵌会话列表）"""
         sessions = list_active_sessions()
         current = self._chat_sessions.get(chat_id)
@@ -551,7 +564,7 @@ class LarkHandler:
             for cid in self._group_chat_ids
             if cid in self._chat_bindings
         }
-        card = build_menu_card(sessions, current_session=current, session_groups=session_groups)
+        card = build_menu_card(sessions, current_session=current, session_groups=session_groups, page=page)
         await self._send_or_update_card(chat_id, card, message_id)
 
     async def _cmd_ls(self, user_id: str, chat_id: str, args: str,
@@ -665,11 +678,6 @@ class LarkHandler:
             # 立即 attach，让新群即刻开始接收 Claude 输出
             await self._attach(group_chat_id, session_name)
 
-            await card_service.send_text(
-                chat_id,
-                f"✅ 已创建专属群「{group_name}」并已连接\n"
-                f"在群内直接发消息即可与 Claude 交互"
-            )
             # 刷新会话列表卡片，使"创建群聊"按钮变为"进入群聊"
             await self._cmd_list(user_id, chat_id, message_id=message_id)
         except Exception as e:
@@ -727,16 +735,16 @@ class LarkHandler:
                 logger.error(f"解散群 API 失败: {feishu_msg}")
 
             # 无论 Feishu delete 是否成功，都清理本地绑定
-            self._remove_binding_by_chat(group_chat_id)
             self._group_chat_ids.discard(group_chat_id)
             self._save_group_chat_ids()
+            self._remove_binding_by_chat(group_chat_id, force=True)
             await self._detach(group_chat_id)
 
-            if feishu_ok:
-                notice = "✅ 群聊已解散，绑定已解除"
-            else:
-                notice = f"⚠️ Feishu 群解散失败（{feishu_msg}），已解除本地绑定。如需彻底解散请在飞书群内手动操作"
-            await card_service.send_text(chat_id, notice)
+            if not feishu_ok:
+                await card_service.send_text(
+                    chat_id,
+                    f"⚠️ Feishu 群解散失败（{feishu_msg}），已解除本地绑定。如需彻底解散请在飞书群内手动操作"
+                )
             await self._cmd_list(user_id, chat_id, message_id=message_id)
         except Exception as e:
             logger.error(f"解散群失败: {e}")
@@ -755,7 +763,9 @@ class LarkHandler:
                 logger.info(f"自动恢复绑定: chat_id={chat_id[:8]}..., session={saved_session}")
                 ok = await self._attach(chat_id, saved_session)
                 if not ok:
-                    self._remove_binding_by_chat(chat_id)
+                    self._group_chat_ids.discard(chat_id)
+                    self._save_group_chat_ids()
+                    self._remove_binding_by_chat(chat_id, force=True)
                     await card_service.send_text(
                         chat_id, f"会话 '{saved_session}' 已不存在，请重新 /attach"
                     )

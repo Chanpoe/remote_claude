@@ -21,6 +21,8 @@ if [[ -n "$ZSH_VERSION" ]]; then
             'status:显示会话状态'
             'lark:飞书客户端管理'
             'stats:查看使用统计'
+            'log:查看会话日志'
+            'update:更新到最新版本'
         )
         lark_cmds=(
             'start:启动飞书客户端'
@@ -30,7 +32,7 @@ if [[ -n "$ZSH_VERSION" ]]; then
         )
 
         case $words[2] in
-            attach|kill|status)
+            attach|kill|status|log)
                 sessions=( ${(f)"$(_remote_claude_get_sessions)"} )
                 _describe '会话名称' sessions
                 ;;
@@ -51,7 +53,7 @@ else
         local cur
         cur="${COMP_WORDS[COMP_CWORD]}"
 
-        local commands="start attach list kill status lark stats"
+        local commands="start attach list kill status lark stats log update"
         local lark_cmds="start stop restart status"
 
         if [[ $COMP_CWORD -eq 1 ]]; then
@@ -60,7 +62,7 @@ else
         fi
 
         case "${COMP_WORDS[1]}" in
-            attach|kill|status)
+            attach|kill|status|log)
                 local sessions
                 sessions=$(_remote_claude_get_sessions)
                 COMPREPLY=( $(compgen -W "$sessions" -- "$cur") )

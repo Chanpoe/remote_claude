@@ -161,5 +161,21 @@ class PlanBlock:
     ansi_content: str = ""
 
 
+@dataclass
+class SystemBlock:
+    """系统提示块（✻ 等星号字符开头，不闪烁）
+
+    累积型 Block：出现在输出区，保留在 blocks 历史列表中。
+    与 StatusLine 的区别：StatusLine 首列星号字符闪烁（blink=True），
+    SystemBlock 首列星号字符不闪烁（blink=False）。
+    典型内容：Claude CLI 系统提示信息、上下文加载通知等。
+    """
+    content: str          # 星号字符之后的内容（已去掉首列星号，\\n 连接）
+    start_row: int = -1   # 在终端屏幕中的起始行号
+    ansi_content: str = ""     # 对应 content，带 ANSI 转义码
+    indicator: str = ""        # 首列星号字符原文（如 ✻）
+    ansi_indicator: str = ""   # 带 ANSI 颜色的星号字符
+
+
 # 所有组件类型的联合类型
-Component = Union[OutputBlock, TextBlock, UserInput, ToolCall, AgentBlock, OptionBlock, PermissionBlock, StatusLine, Divider, BottomBar, AgentPanelBlock, PlanBlock]
+Component = Union[OutputBlock, TextBlock, UserInput, ToolCall, AgentBlock, OptionBlock, PermissionBlock, StatusLine, Divider, BottomBar, AgentPanelBlock, PlanBlock, SystemBlock]

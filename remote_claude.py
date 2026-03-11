@@ -79,6 +79,8 @@ def cmd_start(args):
     claude_args_str = " ".join(f"'{arg}'" for arg in claude_args)
     debug_flag = " --debug-screen" if getattr(args, "debug_screen", False) else ""
     debug_verbose_flag = " --debug-verbose" if getattr(args, "debug_verbose", False) else ""
+    cli_type = getattr(args, "cli", "claude")
+    cli_type_flag = f" --cli-type {cli_type}" if cli_type != "claude" else ""
 
     # 捕获用户终端环境变量（tmux 会覆盖这些值，导致 Claude CLI 无法启用 kitty keyboard protocol）
     env_prefix = ""
@@ -87,7 +89,7 @@ def cmd_start(args):
         if val:
             env_prefix += f"{key}='{val}' "
 
-    server_cmd = f"{env_prefix}uv run --project '{SCRIPT_DIR}' python3 '{server_script}'{debug_flag}{debug_verbose_flag} -- '{session_name}' {claude_args_str}"
+    server_cmd = f"{env_prefix}uv run --project '{SCRIPT_DIR}' python3 '{server_script}'{debug_flag}{debug_verbose_flag}{cli_type_flag} -- '{session_name}' {claude_args_str}"
 
     print(f"启动会话: {session_name}")
 
@@ -499,6 +501,12 @@ def main():
         "--debug-verbose",
         action="store_true",
         help="debug 日志输出完整诊断信息（indicator、repr 等），默认只输出 ansi_render"
+    )
+    start_parser.add_argument(
+        "--cli",
+        default="claude",
+        choices=["claude", "codex"],
+        help="后端 CLI 类型（默认 claude）"
     )
     start_parser.set_defaults(func=cmd_start)
 

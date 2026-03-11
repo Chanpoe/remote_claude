@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -e
-
 # 颜色定义
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
@@ -128,7 +126,7 @@ check_uv() {
     # 方式五：brew（macOS 备用）
     if ! command -v uv &> /dev/null && [[ "$OS" == "Darwin" ]] && command -v brew &> /dev/null; then
         print_warning "尝试 brew install uv..."
-        brew install uv
+        brew install uv 2>/dev/null || true
     fi
 
     if command -v uv &> /dev/null; then
@@ -181,18 +179,18 @@ check_tmux() {
                 fi
                 print_success "Homebrew 安装成功"
             fi
-            brew install tmux
+            brew install tmux 2>/dev/null || true
         elif [[ "$OS" == "Linux" ]]; then
             if command -v apt-get &> /dev/null; then
-                sudo apt-get update && sudo apt-get install -y tmux
+                sudo apt-get update && sudo apt-get install -y tmux || true
             elif command -v yum &> /dev/null; then
-                sudo yum install -y tmux
+                sudo yum install -y tmux || true
             elif command -v pacman &> /dev/null; then
-                sudo pacman -Sy --noconfirm tmux
+                sudo pacman -Sy --noconfirm tmux || true
             elif command -v apk &> /dev/null; then
-                sudo apk add --no-cache tmux
+                sudo apk add --no-cache tmux || true
             elif command -v zypper &> /dev/null; then
-                sudo zypper install -y tmux
+                sudo zypper install -y tmux || true
             else
                 print_warning "无法识别包管理器，尝试从源码编译 tmux..."
                 install_tmux_from_source
@@ -212,10 +210,10 @@ check_tmux() {
         if [[ "$OS" == "Darwin" ]]; then
             brew install libevent ncurses pkg-config bison 2>/dev/null || true
         elif command -v apt-get &> /dev/null; then
-            sudo apt-get install -y build-essential libevent-dev libncurses5-dev libncursesw5-dev bison pkg-config
+            sudo apt-get install -y build-essential libevent-dev libncurses5-dev libncursesw5-dev bison pkg-config || true
         elif command -v yum &> /dev/null; then
-            sudo yum groupinstall -y "Development Tools"
-            sudo yum install -y libevent-devel ncurses-devel bison
+            sudo yum groupinstall -y "Development Tools" || true
+            sudo yum install -y libevent-devel ncurses-devel bison || true
         fi
 
         # 确定安装前缀
@@ -249,9 +247,9 @@ check_tmux() {
         fi
 
         if [[ "$PREFIX" == "/usr/local" ]]; then
-            sudo make -C "$SRC_DIR" install
+            sudo make -C "$SRC_DIR" install || { WARNINGS+=("tmux make install 失败，请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"); return; }
         else
-            make -C "$SRC_DIR" install
+            make -C "$SRC_DIR" install || { WARNINGS+=("tmux make install 失败，请手动安装 tmux ${REQUIRED_MAJOR}.${REQUIRED_MINOR}+"); return; }
             # 若 $HOME/.local/bin 不在 PATH 中，自动写入 shell 配置
             if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
                 export PATH="$HOME/.local/bin:$PATH"
@@ -363,9 +361,9 @@ install_dependencies() {
 
     print_info "正在通过 uv 同步依赖..."
     if $NPM_MODE; then
-        uv sync --frozen
+        uv sync || { print_error "依赖安装失败"; exit 1; }
     else
-        uv sync
+        uv sync || { print_error "依赖安装失败"; exit 1; }
     fi
 
     print_success "依赖安装完成"
@@ -451,7 +449,7 @@ configure_shell() {
     print_header "安装快捷命令"
 
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    chmod +x "$SCRIPT_DIR/bin/cla" "$SCRIPT_DIR/bin/cl" "$SCRIPT_DIR/bin/remote-claude"
+    chmod +x "$SCRIPT_DIR/bin/cla" "$SCRIPT_DIR/bin/cl" "$SCRIPT_DIR/bin/remote-claude" 2>/dev/null || true
 
     # 优先 /usr/local/bin，权限不够则选 ~/bin 或 ~/.local/bin 中已在 PATH 里的
     BIN_DIR="/usr/local/bin"
@@ -479,12 +477,12 @@ configure_shell() {
             fi
         fi
         mkdir -p "$BIN_DIR"
-        ln -sf "$SCRIPT_DIR/bin/cla"          "$BIN_DIR/cla"
-        ln -sf "$SCRIPT_DIR/bin/cl"           "$BIN_DIR/cl"
-        ln -sf "$SCRIPT_DIR/bin/remote-claude" "$BIN_DIR/remote-claude"
+        ln -sf "$SCRIPT_DIR/bin/cla"           "$BIN_DIR/cla"          2>/dev/null || true
+        ln -sf "$SCRIPT_DIR/bin/cl"            "$BIN_DIR/cl"           2>/dev/null || true
+        ln -sf "$SCRIPT_DIR/bin/remote-claude" "$BIN_DIR/remote-claude" 2>/dev/null || true
     else
-        ln -sf "$SCRIPT_DIR/bin/cl"           "$BIN_DIR/cl"
-        ln -sf "$SCRIPT_DIR/bin/remote-claude" "$BIN_DIR/remote-claude"
+        ln -sf "$SCRIPT_DIR/bin/cl"            "$BIN_DIR/cl"           2>/dev/null || true
+        ln -sf "$SCRIPT_DIR/bin/remote-claude" "$BIN_DIR/remote-claude" 2>/dev/null || true
     fi
 
     print_success "已安装 cla、cl 和 remote-claude 到 $BIN_DIR"
@@ -525,7 +523,7 @@ restart_lark_client() {
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
     print_info "正在重启飞书客户端..."
     cd "$SCRIPT_DIR"
-    uv run python3 remote_claude.py lark restart
+    uv run python3 remote_claude.py lark restart || { WARNINGS+=("飞书客户端重启失败，请手动运行: uv run python3 remote_claude.py lark restart"); return; }
     print_success "飞书客户端已重启"
 }
 

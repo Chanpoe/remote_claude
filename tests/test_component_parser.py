@@ -1710,6 +1710,172 @@ class TestPlanBlockParser:
         return self.failed == 0
 
 
+class TestSystemBlockParser:
+    """SystemBlock 解析测试（首列星号字符不闪烁）"""
+
+    def __init__(self):
+        self.passed = 0
+        self.failed = 0
+        self.errors = []
+
+    def _pass(self, name):
+        self.passed += 1
+        print(f"  ✓ {name}")
+
+    def _fail(self, name, msg=""):
+        self.failed += 1
+        self.errors.append(f"{name}: {msg}")
+        print(f"  ✗ {name}: {msg}")
+
+    def _make_parser_and_screen(self, text, cols=220, lines=50):
+        """创建 ScreenParser 和 pyte Screen"""
+        sys.path.insert(0, str(Path(__file__).parent.parent / 'server'))
+        from component_parser import ScreenParser
+        screen = pyte.Screen(cols, lines)
+        stream = pyte.Stream(screen)
+        stream.feed(text)
+        parser = ScreenParser()
+        return parser, screen
+
+    def test_non_blink_star_is_system_block(self):
+        """非闪烁星号字符应解析为 SystemBlock 而非 StatusLine"""
+        from utils.components import SystemBlock as SB, StatusLine as SL
+        divider = '─' * 80
+        # ✻ 不带 blink 转义码（普通写入，pyte 不设置 blink 属性）
+        text = (
+            '❯ hello\r\n'
+            '⏺ 你好！\r\n'
+            '✻ System prompt loaded.\r\n'
+            f'{divider}\r\n'
+            '❯ \r\n'
+            f'{divider}\r\n'
+            'bypass permissions on · esc to interrupt\r\n'
+        )
+        parser, screen = self._make_parser_and_screen(text)
+        components = parser.parse(screen)
+
+        system_blocks = [c for c in components if isinstance(c, SB)]
+        status_lines = [c for c in components if isinstance(c, SL)]
+        if len(system_blocks) != 1:
+            self._fail("non_blink_star_is_system_block",
+                       f"应有1个 SystemBlock，实际 {len(system_blocks)}；StatusLine={len(status_lines)}")
+            return
+        sb = system_blocks[0]
+        if 'System prompt loaded' not in sb.content:
+            self._fail("non_blink_star_is_system_block", f"content 不正确: {sb.content!r}")
+            return
+        if sb.indicator != '✻':
+            self._fail("non_blink_star_is_system_block", f"indicator 应为 ✻，实际 {sb.indicator!r}")
+            return
+        self._pass("non_blink_star_is_system_block")
+
+    def test_blink_star_is_status_line(self):
+        """闪烁星号字符仍应解析为 StatusLine"""
+        from utils.components import SystemBlock as SB, StatusLine as SL
+        divider = '─' * 80
+        # \x1b[5m 开启 blink，\x1b[25m 关闭
+        text = (
+            '❯ hello\r\n'
+            '⏺ 处理中...\r\n'
+            '\x1b[5m✱\x1b[25m Thinking... (5s · ↓ 1k tokens)\r\n'
+            f'{divider}\r\n'
+            '❯ \r\n'
+            f'{divider}\r\n'
+            'bypass permissions on\r\n'
+        )
+        parser, screen = self._make_parser_and_screen(text)
+        components = parser.parse(screen)
+
+        status_lines = [c for c in components if isinstance(c, SL)]
+        system_blocks = [c for c in components if isinstance(c, SB)]
+        if len(status_lines) != 1:
+            self._fail("blink_star_is_status_line",
+                       f"应有1个 StatusLine，实际 {len(status_lines)}")
+            return
+        if len(system_blocks) != 0:
+            self._fail("blink_star_is_status_line",
+                       f"不应有 SystemBlock，实际 {len(system_blocks)}")
+            return
+        sl = status_lines[0]
+        if 'Thinking' not in sl.action:
+            self._fail("blink_star_is_status_line", f"action 不正确: {sl.action!r}")
+            return
+        self._pass("blink_star_is_status_line")
+
+    def test_system_block_multiline(self):
+        """多行系统提示块"""
+        from utils.components import SystemBlock as SB
+        divider = '─' * 80
+        text = (
+            '❯ hello\r\n'
+            '✻ Context loaded from CLAUDE.md\r\n'
+            '  Additional context info here\r\n'
+            f'{divider}\r\n'
+            '❯ \r\n'
+            f'{divider}\r\n'
+            'bypass permissions on\r\n'
+        )
+        parser, screen = self._make_parser_and_screen(text)
+        components = parser.parse(screen)
+
+        system_blocks = [c for c in components if isinstance(c, SB)]
+        if len(system_blocks) != 1:
+            self._fail("system_block_multiline",
+                       f"应有1个 SystemBlock，实际 {len(system_blocks)}")
+            return
+        sb = system_blocks[0]
+        if 'Context loaded' not in sb.content:
+            self._fail("system_block_multiline", f"content 首行不正确: {sb.content!r}")
+            return
+        self._pass("system_block_multiline")
+
+    def test_system_block_block_id_prefix(self):
+        """SystemBlock 的 block_id 应使用 S: 前缀"""
+        sys.path.insert(0, str(Path(__file__).parent.parent / 'server'))
+        from shared_state import _block_id_from_dict
+        d = {"_type": "SystemBlock", "content": "Context loaded from CLAUDE.md"}
+        bid = _block_id_from_dict(d)
+        if not bid.startswith("S:"):
+            self._fail("system_block_block_id_prefix",
+                       f"block_id 应以 S: 开头，实际 {bid!r}")
+            return
+        if "Context loaded" not in bid:
+            self._fail("system_block_block_id_prefix",
+                       f"block_id 内容不正确: {bid!r}")
+            return
+        self._pass("system_block_block_id_prefix")
+
+    def run_all(self):
+        """运行所有 SystemBlock 测试"""
+        print()
+        print("=" * 60)
+        print("SystemBlock 解析测试（首列星号字符不闪烁）")
+        print("=" * 60)
+
+        tests = [
+            self.test_non_blink_star_is_system_block,
+            self.test_blink_star_is_status_line,
+            self.test_system_block_multiline,
+            self.test_system_block_block_id_prefix,
+        ]
+
+        for test in tests:
+            try:
+                test()
+            except Exception as e:
+                import traceback
+                self._fail(test.__name__, f"异常: {e}\n{traceback.format_exc()}")
+
+        print()
+        print(f"结果: {self.passed} 通过, {self.failed} 失败, 共 {self.passed + self.failed} 个测试")
+        if self.errors:
+            print(f"\n失败详情:")
+            for err in self.errors:
+                print(f"  - {err}")
+
+        return self.failed == 0
+
+
 class TestInlineBoxStripper:
     """OutputBlock 内嵌框线去除测试（server 端 _strip_inline_boxes_pair）"""
 
@@ -1878,4 +2044,8 @@ if __name__ == "__main__":
     runner5 = TestInlineBoxStripper()
     success5 = runner5.run_all()
 
-    sys.exit(0 if (success1 and success2 and success3 and success4 and success5) else 1)
+    # 运行 SystemBlock 测试
+    runner6 = TestSystemBlockParser()
+    success6 = runner6.run_all()
+
+    sys.exit(0 if (success1 and success2 and success3 and success4 and success5 and success6) else 1)

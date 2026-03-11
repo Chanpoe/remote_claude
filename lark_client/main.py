@@ -176,6 +176,13 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
             asyncio.create_task(handler._cmd_ls(user_id, chat_id, path, message_id=message_id))
             return None
 
+        # 菜单卡片：会话列表翻页
+        if action_type == "menu_page":
+            page = int(action_value.get("page", 0))
+            print(f"[Lark] menu_page: page={page}")
+            asyncio.create_task(handler._cmd_menu(user_id, chat_id, message_id=message_id, page=page))
+            return None
+
         # 目录卡片：翻页
         if action_type == "dir_page":
             path = action_value.get("path", "")

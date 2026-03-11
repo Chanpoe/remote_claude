@@ -83,6 +83,7 @@ class ClaudeWindow:
     input_area_ansi_text: str = ''
     timestamp: float = 0.0
     layout_mode: str = "normal"  # "normal" | "option" | "detail" | "agent_list" | "agent_detail"
+    cli_type: str = "claude"     # "claude" | "codex"（决定 lark 侧的标题文案）
 
 
 
@@ -96,11 +97,14 @@ class OutputWatcher:
     WINDOW_SECONDS = 1.0
 
     def __init__(self, session_name: str, cols: int, rows: int,
+                 parser=None,
+                 cli_type: str = "claude",
                  on_snapshot=None, debug_screen: bool = False,
                  debug_verbose: bool = False):
         self._session_name = session_name
         self._cols = cols
         self._rows = rows
+        self._cli_type = cli_type
         self._pending = False
         self._on_snapshot = on_snapshot  # 回调：写共享内存
         self._debug_screen = debug_screen  # --debug-screen 开启后才写 _screen.log
@@ -110,8 +114,7 @@ class OutputWatcher:
         # 持久化 pyte 渲染器：PTY 数据直接实时喂入，flush 时直接读 screen
         from rich_text_renderer import RichTextRenderer
         self._renderer = RichTextRenderer(columns=cols, lines=rows)
-        # 持久化解析器（跨帧保留 dot_row_cache）
-        from component_parser import ScreenParser
+        # 持久化解析器（跨帧保留 dot_row_cache）；由调用方注入（可插拔架构）
         import logging as _logging
         _logging.getLogger('ComponentParser').setLevel(_logging.DEBUG)
         _blink_handler = _logging.FileHandler(
@@ -119,7 +122,10 @@ class OutputWatcher:
         )
         _blink_handler.setFormatter(_logging.Formatter('%(asctime)s %(message)s', '%H:%M:%S'))
         _logging.getLogger('ComponentParser').addHandler(_blink_handler)
-        self._parser = ScreenParser()
+        if parser is None:
+            from parsers import ClaudeParser
+            parser = ClaudeParser()
+        self._parser = parser
         # 时序窗口（迁移自 MessageQueue）
         self._frame_window: deque = deque()
         # 最近快照（供外部读取）
@@ -295,6 +301,7 @@ class OutputWatcher:
                 input_area_ansi_text=input_ansi_text,
                 timestamp=now,
                 layout_mode=self._parser.last_layout_mode,
+                cli_type=self._cli_type,
             )
             self.last_window = window
 
@@ -320,7 +327,7 @@ class OutputWatcher:
     def _write_window_debug(self, window: ClaudeWindow):
         """将 ClaudeWindow 快照写入调试文件"""
         try:
-            from utils.components import OutputBlock, UserInput, OptionBlock, AgentPanelBlock
+            from utils.components import OutputBlock, UserInput, OptionBlock, AgentPanelBlock, SystemBlock
             lines = [
                 f"=== ClaudeWindow snapshot  {time.strftime('%H:%M:%S')} ===",
                 f"session={self._session_name}",
@@ -420,6 +427,23 @@ class OutputWatcher:
                             lines.append(f"[{i}] UserInput: {indicator_prefix}{ansi_render}\x1b[0m")
                         else:
                             lines.append(f"[{i}] UserInput: {block.text[:80]}")
+                elif isinstance(block, SystemBlock):
+                    if self._debug_verbose:
+                        content_preview = block.content[:120].replace('\n', '\\n')
+                        lines.append(f"[{i}] SystemBlock: {content_preview}")
+                        if block.indicator:
+                            lines.append(f"      indicator={block.indicator!r}  ansi_indicator={block.ansi_indicator!r}")
+                        if block.ansi_content:
+                            ansi_render = block.ansi_content.replace('\n', '\\n')
+                            indicator_prefix = (block.ansi_indicator + ' ') if block.ansi_indicator else ''
+                            lines.append(f"      ansi_render: {indicator_prefix}{ansi_render}\x1b[0m")
+                    else:
+                        if block.ansi_content:
+                            ansi_render = block.ansi_content.replace('\n', '\\n')
+                            indicator_prefix = (block.ansi_indicator + ' ') if block.ansi_indicator else ''
+                            lines.append(f"[{i}] SystemBlock: {indicator_prefix}{ansi_render}\x1b[0m")
+                        else:
+                            lines.append(f"[{i}] SystemBlock: {block.content[:120].replace(chr(10), chr(92)+'n')}")
                 else:
                     lines.append(f"[{i}] {type(block).__name__}: {str(block)[:self._debug_truncate_len]}")
             lines.append("")
@@ -541,10 +565,12 @@ class ProxyServer:
 
     def __init__(self, session_name: str, claude_args: list = None,
                  claude_cmd: str = "claude",
+                 cli_type: str = "claude",
                  debug_screen: bool = False, debug_verbose: bool = False):
         self.session_name = session_name
         self.claude_args = claude_args or []
         self.claude_cmd = claude_cmd
+        self.cli_type = cli_type
         self.debug_screen = debug_screen
         self.debug_verbose = debug_verbose
         self.socket_path = get_socket_path(session_name)
@@ -568,6 +594,8 @@ class ProxyServer:
         self.output_watcher = OutputWatcher(
             session_name=session_name,
             cols=self.PTY_COLS, rows=self.PTY_ROWS,
+            parser=self._get_parser(),
+            cli_type=self.cli_type,
             on_snapshot=lambda w: self.shared_state.write_snapshot(w),
             debug_screen=self.debug_screen,
             debug_verbose=self.debug_verbose,
@@ -613,6 +641,19 @@ class ProxyServer:
     PTY_COLS = 220
     PTY_ROWS = 2000
 
+    def _get_parser(self):
+        """根据 cli_type 返回对应的解析器实例"""
+        from parsers import ClaudeParser, CodexParser
+        if self.cli_type == "codex":
+            return CodexParser()
+        return ClaudeParser()
+
+    def _get_effective_cmd(self) -> str:
+        """根据 cli_type 返回实际执行的命令（codex 时使用 'codex'，否则用 claude_cmd）"""
+        if self.cli_type == "codex":
+            return "codex"
+        return self.claude_cmd
+
     def _start_pty(self):
         """启动 PTY 并运行 Claude"""
         # 加载环境变量快照（从 cmd_start 保存的快照文件恢复调用方 shell 的完整环境）
@@ -648,7 +689,7 @@ class ProxyServer:
             child_env.pop('TMUX', None)
             child_env.pop('TMUX_PANE', None)
             import shlex as _shlex
-            _cmd_parts = _shlex.split(self.claude_cmd)
+            _cmd_parts = _shlex.split(self._get_effective_cmd())
             os.execvpe(_cmd_parts[0], _cmd_parts + self.claude_args, child_env)
             os._exit(1)  # execvpe 失败时兜底退出
         else:
@@ -664,7 +705,8 @@ class ProxyServer:
             flags = fcntl.fcntl(fd, fcntl.F_GETFL)
             fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
-            print(f"[Server] Claude 已启动 (PID: {pid}, PTY: {self.PTY_COLS}×{self.PTY_ROWS})")
+            cli_label = self.cli_type.capitalize()
+            print(f"[Server] {cli_label} 已启动 (PID: {pid}, PTY: {self.PTY_COLS}×{self.PTY_ROWS})")
 
     async def _read_pty(self):
         """读取 PTY 输出并广播"""
@@ -813,9 +855,11 @@ class ProxyServer:
 
 def run_server(session_name: str, claude_args: list = None,
                claude_cmd: str = "claude",
+               cli_type: str = "claude",
                debug_screen: bool = False, debug_verbose: bool = False):
     """运行服务器"""
     server = ProxyServer(session_name, claude_args, claude_cmd=claude_cmd,
+                         cli_type=cli_type,
                          debug_screen=debug_screen, debug_verbose=debug_verbose)
 
     # 信号处理
@@ -837,7 +881,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Remote Claude Server")
     parser.add_argument("session_name", help="会话名称")
-    parser.add_argument("claude_args", nargs="*", help="传递给 Claude 的参数")
+    parser.add_argument("claude_args", nargs="*", help="传递给 Claude/Codex 的参数")
+    parser.add_argument("--cli-type", default="claude", choices=["claude", "codex"],
+                        help="后端 CLI 类型（默认 claude）")
     parser.add_argument("--debug-screen", action="store_true",
                         help="开启 pyte 屏幕快照调试日志（写入 _screen.log）")
     parser.add_argument("--debug-verbose", action="store_true",
@@ -846,4 +892,5 @@ if __name__ == "__main__":
 
     claude_cmd = os.environ.get("CLAUDE_COMMAND", "claude")
     run_server(args.session_name, args.claude_args, claude_cmd=claude_cmd,
+               cli_type=args.cli_type,
                debug_screen=args.debug_screen, debug_verbose=args.debug_verbose)

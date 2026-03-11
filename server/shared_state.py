@@ -80,6 +80,10 @@ def _block_id_from_dict(d: dict) -> str:
         return f"AP:list:{d.get('agent_count', 0)}"
     elif t == 'PlanBlock':
         return f"PL:{d.get('title', '')[:80]}"
+    elif t == 'SystemBlock':
+        content = d.get('content', '')
+        first_line = content.split('\n', 1)[0].strip()[:80]
+        return f"S:{first_line}"
     return ""
 
 
@@ -135,6 +139,7 @@ class SharedStateWriter:
                 "input_area_text": window.input_area_text,
                 "timestamp": window.timestamp,
                 "layout_mode": window.layout_mode,
+                "cli_type": getattr(window, "cli_type", "claude"),
             }
             data = json.dumps(snapshot, ensure_ascii=False).encode('utf-8')
 
