@@ -24,7 +24,9 @@ client.py  SessionBridge (lark_client/)
 **核心模块：**
 - `remote_claude.py` — CLI 入口，子命令：start / attach / list / kill / lark
 - `server/server.py` — PTY 代理服务器，`pty.fork()` 启动 Claude，asyncio Unix Socket 广播输出
-- `server/component_parser.py` — 终端输出解析（区域切分、Block 分类、执行状态判断）
+- `server/parsers/claude_parser.py` — Claude CLI 终端输出解析（区域切分、Block 分类、执行状态判断）
+- `server/parsers/codex_parser.py` — Codex CLI 终端输出解析（无分割线、`›` 提示符、背景色区域检测）
+- `server/component_parser.py` — 向后兼容 shim（实际实现在 `server/parsers/`）
 - `server/shared_state.py` — 共享内存写入（`.mq` 文件）
 - `client/client.py` — 终端客户端，raw mode 输入转发
 - `utils/protocol.py` — 消息协议（JSON + `\n` 分隔，二进制数据 base64 编码）。7 种消息类型：INPUT / OUTPUT / CONTROL / STATUS / HISTORY / ERROR / RESIZE
@@ -442,6 +444,88 @@ OptionBlock 已统一为**状态型组件**，存储在 `ClaudeWindow.option_blo
 - **布局模式切换时清空整个缓存**：`dot_row_cache` 以行号为 key，但 detail 和 normal 模式下同一行号对应不同内容（detail 模式输出区更大、行号整体上移）。切换时若不清空，残留行号会被误判为"闪烁隐去帧"，产生幽灵 block header 导致 block 重复。采用单一 cache + 模式切换时 `clear()` 的方案，比双缓存（normal/detail 各一份）更简单可靠
 - 闪烁频率不固定（可能 1 秒 1 次或 1 秒 2 次），不可依赖固定频率；需结合状态行是否存在辅助判断
 
+---
+
+**Codex CLI 终端输出解析规则（`server/parsers/codex_parser.py`）：**
+
+Codex 与 Claude Code 的终端布局有本质差异，由 `CodexParser` 单独处理。
+
+### Codex 终端布局（实测）
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  （大量空行）                                            │  ← 欢迎框上方空行，直接跳过
+│                                                         │
+│ ╭─────────────────────────────────────────────────────╮ │  ← 欢迎框（无固定行号，
+│ │ >_ OpenAI Codex (v0.114.0)                          │ │     首列 ╭，第一个非空内容）
+│ │  model:     gpt-5.1-codex-2025-11-13 high           │ │
+│ │  directory: ~/dev/...                               │ │
+│ ╰─────────────────────────────────────────────────────╯ │
+│   Tip: New Build faster with the Codex App...           │  ← Tip 行（缩进，跳过）
+│                                                         │
+│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│  ← 背景色分割线（无文字，整行 bg）
+│ › Output: user typed this                               │  ← 历史 UserInput（› U+203A）
+│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│  ← 背景色分割线
+│                                                         │
+│ •  Codex response here                                  │  ← OutputBlock（• 圆点）
+│                                                         │
+│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│  ← 背景色分割线（效果同 ─━═）
+│ › current input text here                               │  ← 当前输入区
+│▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓│  ← 背景色分割线
+│   gpt-5.1-codex-2025-11-13 high · 100% left · ~/dev/   │  ← 底部栏（有文字的 bg 行）
+└─────────────────────────────────────────────────────────┘
+```
+
+**背景色行的两种角色：**
+- **背景色分割线**：整行有非默认背景色，但**无文字内容**（仅 bg 色的空格）→ 等同于 Claude Code 的 `─━═` 分割线
+- **底部栏**：有非默认背景色，且**有文字内容**（模型名、进度等）
+
+**与 Claude Code 的关键差异：**
+
+| 特性 | Claude Code | Codex |
+|------|------------|-------|
+| 区域分割 | `─━═` 分割线 | **无分割线**，用背景色 + 位置判断 |
+| 输入提示符 | `❯` (U+276F) | **`›` (U+203A)** |
+| 欢迎框位置 | 屏幕顶部（行 0） | 屏幕中部（大量空行之后） |
+| 欢迎框内容 | `Claude Code vX.X.X` | `>_ OpenAI Codex (vX.X.X)` + `model:` + `directory:` |
+| 底部栏 | 最后一条分割线之后 | 输入区之后所有行（含空格开头的模型信息行） |
+| StatusLine | 星星字符（✱ blink） | `•` 圆点 blink + 内容含 "esc to interrupt" |
+
+### Codex 区域切分策略（`_split_regions`）
+
+用**背景色分割线**（整行有 bg 色但无文字）代替 `─━═` 字符分割线，从底部向上找最后两条：
+
+```
+[输出区]
+[背景色分割线]  ← bg_dividers[1]（上分割线，分隔输出区和输入区）
+[› 当前输入行]  ← input_rows
+[背景色分割线]  ← bg_dividers[0]（下分割线，分隔输入区和底部栏）
+[底部栏]        ← bottom_rows（有文字的 bg 行）
+```
+
+优先级：
+1. **背景色分割线（强，等同 Claude Code 的 `─━═`）**：从下往上找最后两条无文字 bg 行，按上图拆分
+2. **`›` + 背景色组合（次选）**：找最后一个有非默认背景色的 `›` 行
+3. **位置弱信号（回退）**：找最后一个其后无 `•`/`›`/星星字符的 `›` 行
+4. **纯背景色兜底**：无 `›` 行时用 `_find_chrome_boundary`
+
+### Codex 欢迎框识别（`_is_welcome_box`）
+
+欢迎框首列是 `╭`，但**顶边框行不含工具名称**（顶边框只有 `─`），名称在框内第一个 `│` 行。
+识别方式：检查框内前几行是否含以下任意特征：
+- 非默认背景色
+- `>_ `（CLI 提示符前缀）
+- `model:`、`directory:`、`workspace:`（配置信息行）
+
+### Codex Block 分类（`_classify_block`）
+
+- **UserInput**：首列 `›` (U+203A) 或 `>` (U+003E)，由 `CODEX_PROMPT_CHARS` 控制
+- **StatusLine**：首列圆点字符（`•` 等）且 **blink=True** → 状态行（Codex 用 blink 区分，不用星星字符）
+- **OutputBlock**：首列圆点字符（`•` 等）且 **blink=False** → 已完成的输出块
+- **SystemBlock**：`△`（Codex 系统警告）等首列字符，blink=False
+
+> Codex 与 Claude Code 的核心区别：Claude Code 用**不同字符**区分（星星=StatusLine，圆点=OutputBlock），Codex 用**同一圆点字符 + blink 属性**区分。
+
 ## 文件结构
 
 ```
@@ -450,7 +534,11 @@ remote_claude/
 │
 ├── server/                     # PTY 代理服务器
 │   ├── server.py               # 主服务，管理 PTY 进程/控制权/广播
-│   ├── component_parser.py     # 终端输出解析（区域切分/Block 分类）
+│   ├── component_parser.py     # 向后兼容 shim
+│   ├── parsers/
+│   │   ├── base_parser.py      # 解析器基类
+│   │   ├── claude_parser.py    # Claude CLI 解析器
+│   │   └── codex_parser.py     # Codex CLI 解析器（无分割线/›提示符/背景色区域检测）
 │   ├── shared_state.py         # 共享内存写入（.mq 文件）
 │   └── rich_text_renderer.py   # 历史文件（暂保留）
 │

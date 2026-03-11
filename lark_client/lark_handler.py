@@ -318,15 +318,20 @@ class LarkHandler:
         server_script = script_dir / "server" / "server.py"
         cmd = [sys.executable, str(server_script), session_name]
 
-        logger.info(f"启动会话: {session_name}, 工作目录: {work_dir}, 命令: {cmd}")
+        logger.info(f"启动会话: {session_name}, 工作目录: {work_dir}, 命令: {' '.join(cmd)}")
         _track_stats('lark', 'cmd_start', session_name=session_name, chat_id=chat_id)
 
         try:
             import os as _os
+            from datetime import datetime as _datetime
             env = _os.environ.copy()
             env.pop("CLAUDECODE", None)
 
-            subprocess.Popen(
+            from utils.session import USER_DATA_DIR
+            log_path = USER_DATA_DIR / "startup.log"
+            start_time = _datetime.now()
+
+            proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -335,13 +340,38 @@ class LarkHandler:
                 env=env,
             )
 
+            def _read_log_since(since):
+                if not log_path.exists():
+                    return ""
+                lines = []
+                for line in log_path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        ts = _datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S.%f")
+                        if ts >= since:
+                            lines.append(line)
+                    except ValueError:
+                        if lines:
+                            lines.append(line)
+                return "\n".join(lines)
+
             socket_path = get_socket_path(session_name)
-            for _ in range(120):
+            for i in range(120):
                 await asyncio.sleep(0.1)
                 if socket_path.exists():
                     break
+                if (i + 1) % 10 == 0:
+                    elapsed = (i + 1) // 10
+                    rc = proc.poll()
+                    if rc is not None:
+                        log_content = _read_log_since(start_time)
+                        logger.warning(f"会话启动失败: server 进程已退出 (exitcode={rc}, elapsed={elapsed}s)\n{log_content}")
+                        await card_service.send_text(chat_id, f"错误: Server 进程意外退出 (code={rc})\n\n{log_content}")
+                        return
+                    logger.info(f"等待 server socket... ({elapsed}s)")
             else:
-                await card_service.send_text(chat_id, "错误: 会话启动超时")
+                log_content = _read_log_since(start_time)
+                logger.error(f"会话启动超时 (12s), session={session_name}\n{log_content}")
+                await card_service.send_text(chat_id, f"错误: 会话启动超时 (12s)\n\n{log_content}")
                 return
 
             ok = await self._attach(chat_id, session_name)
@@ -401,7 +431,8 @@ class LarkHandler:
             logger.error(f"启动并创建群聊失败: {e}")
             await card_service.send_text(chat_id, f"操作失败：{e}")
 
-    async def _cmd_kill(self, user_id: str, chat_id: str, args: str):
+    async def _cmd_kill(self, user_id: str, chat_id: str, args: str,
+                        message_id: Optional[str] = None):
         """终止会话"""
         from utils.session import cleanup_session, tmux_session_exists, tmux_kill_session
 
@@ -414,6 +445,13 @@ class LarkHandler:
         if not any(s["name"] == session_name for s in sessions):
             await card_service.send_text(chat_id, f"错误: 会话 '{session_name}' 不存在")
             return
+
+        # 解散绑定该会话的专属群聊（必须在断开连接之前，否则 _chat_bindings 已被清除）
+        for cid in list(self._group_chat_ids):
+            if self._chat_bindings.get(cid) == session_name:
+                ok, err = await self._disband_group_via_api(cid)
+                if not ok:
+                    logger.warning(f"关闭会话时解散群 {cid} 失败: {err}")
 
         # 断开所有连接到此会话的 chat
         for cid, sname in list(self._chat_sessions.items()):
@@ -436,6 +474,7 @@ class LarkHandler:
         cleanup_session(session_name)
 
         await card_service.send_text(chat_id, f"✅ 会话 '{session_name}' 已终止")
+        await self._cmd_list(user_id, chat_id, message_id=message_id)
 
     async def _handle_list_detach(self, user_id: str, chat_id: str,
                                    message_id: Optional[str] = None):
@@ -684,17 +723,8 @@ class LarkHandler:
             logger.error(f"创建群失败: {e}")
             await card_service.send_text(chat_id, f"创建群失败：{e}")
 
-    async def _cmd_disband_group(self, user_id: str, chat_id: str, session_name: str,
-                                  message_id: Optional[str] = None):
-        """解散与指定会话绑定的专属群聊"""
-        group_chat_id = next(
-            (cid for cid, sname in self._chat_bindings.items() if sname == session_name and cid.startswith("oc_")),
-            None
-        )
-        if not group_chat_id:
-            await card_service.send_text(chat_id, f"会话 '{session_name}' 没有绑定群聊")
-            return
-
+    async def _disband_group_via_api(self, group_chat_id: str) -> tuple:
+        """调用飞书 API 解散群聊，返回 (ok: bool, err_msg: str)"""
         import json as _json
         import urllib.request
         import urllib.error
@@ -709,9 +739,6 @@ class LarkHandler:
                 ), timeout=10
             )
             token = _json.loads(token_resp.read())["tenant_access_token"]
-
-            feishu_ok = False
-            feishu_msg = ""
             try:
                 disband_resp = urllib.request.urlopen(
                     urllib.request.Request(
@@ -721,17 +748,33 @@ class LarkHandler:
                     ), timeout=10
                 )
                 disband_data = _json.loads(disband_resp.read())
-                feishu_ok = disband_data.get("code") == 0
-                feishu_msg = disband_data.get("msg", "")
+                if disband_data.get("code") == 0:
+                    return True, ""
+                return False, disband_data.get("msg", "")
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode("utf-8", errors="replace")
                 try:
                     err_data = _json.loads(err_body)
-                    feishu_ok = False
-                    feishu_msg = f"code={err_data.get('code')} {err_data.get('msg', '')}"
+                    return False, f"code={err_data.get('code')} {err_data.get('msg', '')}"
                 except Exception:
-                    feishu_ok = False
-                    feishu_msg = f"HTTP {e.code}"
+                    return False, f"HTTP {e.code}"
+        except Exception as e:
+            return False, str(e)
+
+    async def _cmd_disband_group(self, user_id: str, chat_id: str, session_name: str,
+                                  message_id: Optional[str] = None):
+        """解散与指定会话绑定的专属群聊"""
+        group_chat_id = next(
+            (cid for cid, sname in self._chat_bindings.items() if sname == session_name and cid.startswith("oc_")),
+            None
+        )
+        if not group_chat_id:
+            await card_service.send_text(chat_id, f"会话 '{session_name}' 没有绑定群聊")
+            return
+
+        try:
+            feishu_ok, feishu_msg = await self._disband_group_via_api(group_chat_id)
+            if not feishu_ok:
                 logger.error(f"解散群 API 失败: {feishu_msg}")
 
             # 无论 Feishu delete 是否成功，都清理本地绑定

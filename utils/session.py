@@ -101,6 +101,8 @@ def tmux_create_session(session_name: str, command: str, detached: bool = True) 
     args.extend(["-x", "200", "-y", "50"])  # 默认大小
     args.append(command)
 
+    import logging as _logging
+    _logging.getLogger('Start').info(f"tmux_cmd: {' '.join(args)}")
     result = subprocess.run(args, capture_output=True)
     if result.returncode == 0:
         # 启用鼠标支持，允许在 tmux 窗口内用鼠标滚轮查看历史输出

@@ -850,6 +850,18 @@ def _build_session_list_elements(sessions: List[Dict], current_session: Optional
                         "action": "list_disband_group", "session": name
                     }}]
                 })
+            right_buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🗑️ 关闭"},
+                "type": "danger",
+                "confirm": {
+                    "title": {"tag": "plain_text", "content": "确认关闭会话"},
+                    "text": {"tag": "plain_text", "content": f"确定要关闭「{name}」吗？此操作不可撤销。"}
+                },
+                "behaviors": [{"type": "callback", "value": {
+                    "action": "list_kill", "session": name
+                }}]
+            })
             elements.append({
                 "tag": "column_set",
                 "flex_mode": "none",

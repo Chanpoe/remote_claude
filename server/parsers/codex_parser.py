@@ -13,6 +13,8 @@
 
 import re
 import logging
+import time
+from collections import deque
 from typing import List, Optional, Dict, Tuple, Set
 
 import pyte
@@ -39,6 +41,9 @@ DOT_CHARS: Set[str] = {'●', '⏺', '⚫', '•', '◉', '◦', '⏹'}
 
 # 分割线字符集
 DIVIDER_CHARS: Set[str] = set('─━═')
+
+# Codex 输入提示符字符集（› U+203A 是实际使用的字符，> U+003E 兼容保留）
+CODEX_PROMPT_CHARS: Set[str] = {'›', '>'}
 
 # Box-drawing 字符集（Plan Mode 使用的框线字符）
 BOX_CORNER_TOP: Set[str] = {'╭', '┌'}
@@ -110,7 +115,6 @@ _NUMBERED_OPTION_RE = re.compile(r'^(?:>\s*)?\d+[.)]\s+.+')
 _CURSOR_OPTION_RE = re.compile(r'^>\s*(\d+)[.)]\s+.+')
 
 # Codex 状态行检测（首列 ● blink=True + 内容含 "esc to interrupt"）
-_CODEX_STATUS_RE = re.compile(r'^(.+?)\s+\((\d+[smh])\b.*?esc\s+to\s+interrupt', re.IGNORECASE)
 
 
 # ─── ANSI 颜色映射 ─────────────────────────────────────────────────────────────
@@ -289,6 +293,31 @@ def _is_divider_row(screen: pyte.Screen, row: int) -> bool:
     return found
 
 
+def _is_bg_divider_row(screen: pyte.Screen, row: int) -> bool:
+    """判断是否为背景色分割线：整行有非默认背景色但无文字内容。
+
+    Codex 用这类行代替 ─━═ 字符分割线，UserInput 和输入区上下各有一条。
+    与底部栏区别：底部栏有文字内容，背景色分割线只有 bg 色的空格。
+    """
+    if _get_row_dominant_bg(screen, row) == 'default':
+        return False
+    return _get_row_text(screen, row).strip() == ''
+
+
+def _get_row_dominant_bg(screen: pyte.Screen, row: int) -> str:
+    """获取某行最主要的非空字符背景色；'default' 表示默认背景"""
+    bg_counts: Dict[str, int] = {}
+    for col in range(screen.columns):
+        try:
+            char = screen.buffer[row][col]
+        except (KeyError, IndexError):
+            continue
+        if char.data.strip():
+            bg = getattr(char, 'bg', 'default') or 'default'
+            bg_counts[bg] = bg_counts.get(bg, 0) + 1
+    return max(bg_counts, key=bg_counts.get) if bg_counts else 'default'
+
+
 def _has_numbered_options(screen: pyte.Screen, rows: List[int]) -> bool:
     """检测 rows 是否含编号选项行（需 > 锚点 + ≥2 编号行）
 
@@ -367,6 +396,11 @@ class CodexParser(BaseParser):
     def __init__(self):
         # 帧间圆点缓存：布局模式切换时清空，防止残留行号产生幽灵 block
         self._dot_row_cache: Dict[int, Tuple[str, str, str, str, bool]] = {}
+        # 帧间圆点属性缓存：记录上一帧的 (char, fg)，用于检测动画变化（字符/颜色变化 → StatusLine）
+        self._dot_attr_cache: Dict[int, Tuple[str, str]] = {}
+        # 星号滑动窗口（1.5秒）：记录每行最近 1.5 秒内出现的 (timestamp, char)，
+        # 窗口内 ≥2 种不同字符 → spinner 旋转 → StatusLine；始终只有 1 种字符 → SystemBlock
+        self._star_row_history: Dict[int, deque] = {}
         # 最近一次解析到的输入区 ❯ 文本（用于 MessageQueue 追踪变更）
         self.last_input_text: str = ''
         self.last_input_ansi_text: str = ''
@@ -410,9 +444,11 @@ class CodexParser(BaseParser):
         else:
             self.last_layout_mode = 'normal'
 
-        # 模式切换时清空 dot_row_cache，防止残留行号产生幽灵 block
+        # 模式切换时清空缓存，防止残留行号产生幽灵 block
         if self.last_layout_mode != prev_mode:
             self._dot_row_cache.clear()
+            self._dot_attr_cache.clear()
+            self._star_row_history.clear()
 
         # 提取输入区 ❯ 文本（用于 MessageQueue 追踪变更）
         self.last_input_text = self._extract_input_area_text(screen, input_rows)
@@ -490,30 +526,100 @@ class CodexParser(BaseParser):
     def _split_regions(
         self, screen: pyte.Screen
     ) -> Tuple[List[int], List[int], List[int]]:
-        """Codex 无 ─━═ 分割线，全部行视为输出区。
+        """Codex 无 ─━═ 分割线，用背景色分割线（整行 bg 色且无文字）定位区域。
 
-        背景色区分的视觉边界无法从 pyte 文本层面可靠检测，
-        因此将光标以上所有行作为 output_rows，不单独提取 input_rows / bottom_rows。
+        Codex UserInput 和输入区上下各有一条背景色分割线，效果等同 ─━═。
+        从底部向上找最后两条背景色分割线，按以下结构拆分：
+          [输出区] / [bg divider] / [› 输入行] / [bg divider] / [底部栏]
 
-        代价：input_area_text 始终为空（当前输入文本无法提取），
-        但 blocks 流仍能正确累积对话历史。
+        优先级：
+          1. 背景色分割线（强）：从下往上找最后两条无文字 bg 行
+          2. › + 背景色组合（次选）：找最后一个有非默认背景色的 › 行
+          3. 位置弱信号（回退）：找最后一个其后无 block 字符的 › 行
+          4. 纯背景色兜底：无 › 时用 _find_chrome_boundary
         """
         scan_limit = min(screen.cursor.y + 5, screen.lines - 1)
+        _BLOCK_CHARS = DOT_CHARS | CODEX_PROMPT_CHARS | STAR_CHARS
+
+        # Pass 1：背景色分割线（最强信号，等同 ─━═）
+        bg_dividers: List[int] = []
+        for row in range(scan_limit, -1, -1):
+            if _is_bg_divider_row(screen, row):
+                bg_dividers.append(row)
+                if len(bg_dividers) == 2:
+                    break
+        if len(bg_dividers) == 2:
+            div_bottom, div_top = bg_dividers[0], bg_dividers[1]
+            output_rows = self._trim_welcome(screen, list(range(div_top)))
+            input_rows = list(range(div_top + 1, div_bottom))
+            bottom_rows = list(range(div_bottom + 1, scan_limit + 1))
+            return output_rows, input_rows, bottom_rows
+
+        # Pass 2：› + 背景色组合
+        input_boundary = None
+        for row in range(scan_limit, -1, -1):
+            if _get_col0(screen, row) in CODEX_PROMPT_CHARS:
+                if _get_row_dominant_bg(screen, row) != 'default':
+                    input_boundary = row
+                    break
+
+        # Pass 3：位置弱信号
+        if input_boundary is None:
+            for row in range(scan_limit, -1, -1):
+                if _get_col0(screen, row) in CODEX_PROMPT_CHARS:
+                    has_block_after = any(
+                        _get_col0(screen, r) in _BLOCK_CHARS
+                        for r in range(row + 1, scan_limit + 1)
+                    )
+                    if not has_block_after:
+                        input_boundary = row
+                        break
+
+        if input_boundary is not None:
+            output_rows = self._trim_welcome(screen, list(range(input_boundary)))
+            input_rows = [input_boundary]
+            bottom_rows = list(range(input_boundary + 1, scan_limit + 1))
+            return output_rows, input_rows, bottom_rows
+
+        # Pass 4：纯背景色兜底（无 › 行时，如纯查看模式）
+        chrome_start = self._find_chrome_boundary(screen, scan_limit)
+        if chrome_start is not None and chrome_start > 0:
+            output_rows = self._trim_welcome(screen, list(range(chrome_start)))
+            bottom_rows = list(range(chrome_start, scan_limit + 1))
+            return output_rows, [], bottom_rows
+
+        # 最终兜底：全部作为输出区
         output_rows = self._trim_welcome(screen, list(range(scan_limit + 1)))
         return output_rows, [], []
 
+    def _find_chrome_boundary(self, screen: pyte.Screen, scan_limit: int) -> Optional[int]:
+        """背景色检测：从底部往上找连续的非默认背景行（UI chrome）。
+
+        返回 chrome 区域的起始行号；若无则返回 None。
+        """
+        chrome_start = None
+        for row in range(scan_limit, -1, -1):
+            if _get_row_dominant_bg(screen, row) != 'default':
+                chrome_start = row
+            else:
+                break
+        return chrome_start
+
     def _trim_welcome(self, screen: pyte.Screen, rows: List[int]) -> List[int]:
-        """去掉欢迎区域：跳过首列为空的前缀行和欢迎框（OpenAI Codex box）"""
+        """去掉欢迎区域：跳过首列为空的前缀行和欢迎框（OpenAI Codex box）。
+
+        注意：欢迎框顶边框行（╭────╮）本身不含工具名称，工具名在框内第一个 │ 行。
+        因此需检查框内容行，而非顶边框行。
+        """
         i = 0
         while i < len(rows):
             col0 = _get_col0(screen, rows[i])
             if not col0.strip():
                 i += 1
                 continue
-            # 首个非空 col0 是 box 顶角 → 检查是否为欢迎框
+            # 首个非空 col0 是 box 顶角 → 检查框内容行是否为欢迎框
             if col0 in BOX_CORNER_TOP:
-                first_line = _get_row_text(screen, rows[i])
-                if 'OpenAI Codex' in first_line:
+                if self._is_welcome_box(screen, rows, i):
                     # 跳过整个欢迎框（到 ╰/└ 行为止）
                     i += 1
                     while i < len(rows):
@@ -526,10 +632,30 @@ class CodexParser(BaseParser):
             return rows[i:]
         return []
 
+    def _is_welcome_box(self, screen: pyte.Screen, rows: List[int], top_idx: int) -> bool:
+        """判断 box 是否为欢迎框。
+
+        判断逻辑（满足任意一条即为欢迎框）：
+        1. 框内行有非默认背景色（UI 主题框）
+        2. 框内前几行含工具标识（>_ 提示符）或配置信息（model:、directory: 等）
+        """
+        for j in range(top_idx + 1, min(top_idx + 6, len(rows))):
+            col0 = _get_col0(screen, rows[j])
+            if col0 in BOX_CORNER_BOTTOM:
+                break
+            # 条件1：非默认背景色
+            if _get_row_dominant_bg(screen, rows[j]) != 'default':
+                return True
+            # 条件2：内容行含工具配置特征
+            line_text = _get_row_text(screen, rows[j])
+            if any(pat in line_text for pat in ('>_ ', 'model:', 'directory:', 'workspace:')):
+                return True
+        return False
+
     # ─── Step 2+3+4：输出区解析 ────────────────────────────────────────────
 
     def _cleanup_cache(self, screen: pyte.Screen, output_row_set: Set[int]):
-        """清理 dot_row_cache 中不再有效的条目"""
+        """清理 dot_row_cache / star_row_history 中不再有效的条目"""
         for row in list(self._dot_row_cache.keys()):
             if row not in output_row_set:
                 # 行已不在输出区（屏幕滚动等）
@@ -539,6 +665,12 @@ class CodexParser(BaseParser):
             if col0.strip() and col0 not in DOT_CHARS:
                 # 首列变为其他非圆点内容，缓存失效
                 del self._dot_row_cache[row]
+        # 清理 star_row_history：只清理已滚出输出区的行，不根据 col0 内容变化删除
+        # 原因：星星字符闪烁时会暂时变成其他字符（如·）或空白，不应因此清空历史
+        # 历史记录本身有 1.5 秒过期机制，会自动清理过期数据
+        for row in list(self._star_row_history.keys()):
+            if row not in output_row_set:
+                del self._star_row_history[row]
 
     def _parse_output_area(
         self, screen: pyte.Screen, rows: List[int]
@@ -634,8 +766,18 @@ class CodexParser(BaseParser):
         lines = [_get_row_text(screen, r) for r in block_rows]
 
         # 星号字符：blink → StatusLine（状态行），非 blink → SystemBlock（系统提示）
+        # 兜底：1.5秒滑动窗口检测（窗口内 ≥2 种不同字符 → spinner 旋转 → StatusLine）
         if col0 in STAR_CHARS:
-            if is_blink:
+            now = time.time()
+            history = self._star_row_history.setdefault(first_row, deque())
+            # 清理超过 1.5 秒的旧帧
+            while history and history[0][0] < now - 1.5:
+                history.popleft()
+            history.append((now, col0))
+            # 窗口内 ≥2 种不同字符 → spinner 旋转 → StatusLine
+            unique_chars = {c for _, c in history}
+            inferred_blink = is_blink or len(unique_chars) > 1
+            if inferred_blink:
                 return self._parse_status_block(
                     lines[0],
                     ansi_first_line=_get_row_ansi_text(screen, first_row),
@@ -645,8 +787,8 @@ class CodexParser(BaseParser):
             else:
                 return self._parse_system_block(screen, first_row, block_rows, lines, col0)
 
-        # UserInput：>（Codex 使用 ASCII 大于号）
-        if col0 == '>':
+        # UserInput：› U+203A（Codex 实际使用字符）或 > U+003E（兼容）
+        if col0 in CODEX_PROMPT_CHARS:
             first_text = lines[0][1:].strip()
             # 内容全是分割线字符（如 ❯─────...─）→ 装饰性分隔符，忽略
             if not first_text or all(c in DIVIDER_CHARS for c in first_text):
@@ -664,19 +806,42 @@ class CodexParser(BaseParser):
 
         # OutputBlock：圆点字符
         if col0 in DOT_CHARS:
-            # Codex 特有：● blink=True + 内容含 "esc to interrupt" → StatusLine（非 OutputBlock）
+            # Codex：圆点 blink=True → StatusLine；blink=False → OutputBlock
+            # （与 Claude Code 用星星字符区分不同，Codex 用同一圆点字符 + blink 属性区分）
+
+            # 路径1：pyte blink 检测到 → StatusLine（原有逻辑）
             if is_blink:
-                first_text = lines[0][1:].strip() if lines else ''
-                m = _CODEX_STATUS_RE.match(first_text)
-                if m:
-                    action = m.group(1).strip()
-                    elapsed = m.group(2)
-                    ansi_first_line = _get_row_ansi_text(screen, first_row)
-                    return StatusLine(
-                        action=action, elapsed=elapsed, tokens='',
-                        raw=lines[0], ansi_raw=ansi_first_line,
-                        indicator=col0, ansi_indicator=_get_col0_ansi(screen, first_row),
-                    )
+                ansi_first_line = _get_row_ansi_text(screen, first_row)
+                try:
+                    cur_fg = str(getattr(screen.buffer[first_row].get(0), 'fg', ''))
+                except Exception:
+                    cur_fg = ''
+                self._dot_attr_cache[first_row] = (col0, cur_fg)
+                return self._parse_status_block(
+                    lines[0], ansi_first_line=ansi_first_line,
+                    indicator=col0, ansi_indicator=_get_col0_ansi(screen, first_row),
+                )
+
+            # 路径2：字符/颜色变化检测（pyte blink 失效时的兜底）
+            try:
+                cur_fg = str(getattr(screen.buffer[first_row].get(0), 'fg', ''))
+            except Exception:
+                cur_fg = ''
+            prev_attr = self._dot_attr_cache.get(first_row)
+            char_changed = prev_attr is not None and (prev_attr[0] != col0 or prev_attr[1] != cur_fg)
+            self._dot_attr_cache[first_row] = (col0, cur_fg)
+
+            # 路径3：内容含 "esc to interrupt" → Codex StatusLine 的固定特征
+            first_line_text = lines[0] if lines else ''
+            content_is_status = 'esc to interrupt' in first_line_text.lower()
+
+            if char_changed or content_is_status:
+                ansi_first_line = _get_row_ansi_text(screen, first_row)
+                return self._parse_status_block(
+                    lines[0], ansi_first_line=ansi_first_line,
+                    indicator=col0, ansi_indicator=_get_col0_ansi(screen, first_row),
+                )
+
             ind = col0
             ansi_ind = _get_col0_ansi(screen, first_row)
             ansi_first = _get_row_ansi_text(screen, first_row, start_col=1).strip()
@@ -876,19 +1041,19 @@ class CodexParser(BaseParser):
         return None
 
     def _extract_input_area_text(self, screen: pyte.Screen, input_rows: List[int]) -> str:
-        """提取输入区 > 提示符后的当前输入文本（空提示符返回空字符串）"""
+        """提取输入区提示符后的当前输入文本（空提示符返回空字符串）"""
         for row in input_rows:
-            if _get_col0(screen, row) == '>':
+            if _get_col0(screen, row) in CODEX_PROMPT_CHARS:
                 text = _get_row_text(screen, row)[1:].strip()
-                # 排除纯分割线装饰行（如 >─────）
+                # 排除纯分割线装饰行（如 ›─────）
                 if text and not all(c in DIVIDER_CHARS for c in text):
                     return text
         return ''
 
     def _extract_input_area_ansi_text(self, screen: pyte.Screen, input_rows: List[int]) -> str:
-        """提取输入区 > 提示符后的当前输入文本（ANSI 版本）"""
+        """提取输入区提示符后的当前输入文本（ANSI 版本）"""
         for row in input_rows:
-            if _get_col0(screen, row) == '>':
+            if _get_col0(screen, row) in CODEX_PROMPT_CHARS:
                 text = _get_row_text(screen, row)[1:].strip()
                 if text and not all(c in DIVIDER_CHARS for c in text):
                     return _get_row_ansi_text(screen, row, start_col=1).strip()

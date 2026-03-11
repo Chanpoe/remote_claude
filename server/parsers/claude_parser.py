@@ -14,6 +14,8 @@ component_parser.py 保留为向后兼容 shim。
 
 import re
 import logging
+import time
+from collections import deque
 from typing import List, Optional, Dict, Tuple, Set
 
 import pyte
@@ -364,6 +366,9 @@ class ClaudeParser(BaseParser):
     def __init__(self):
         # 帧间圆点缓存：布局模式切换时清空，防止残留行号产生幽灵 block
         self._dot_row_cache: Dict[int, Tuple[str, str, str, str, bool]] = {}
+        # 星号滑动窗口（1秒）：记录每行最近 1 秒内出现的 (timestamp, char)，
+        # 窗口内 ≥2 种不同字符 → spinner 旋转 → StatusLine；始终只有 1 种字符 → SystemBlock
+        self._star_row_history: Dict[int, deque] = {}
         # 最近一次解析到的输入区 ❯ 文本（用于 MessageQueue 追踪变更）
         self.last_input_text: str = ''
         self.last_input_ansi_text: str = ''
@@ -407,9 +412,10 @@ class ClaudeParser(BaseParser):
         else:
             self.last_layout_mode = 'normal'
 
-        # 模式切换时清空 dot_row_cache，防止残留行号产生幽灵 block
+        # 模式切换时清空 dot_row_cache / star_row_history，防止残留行号产生幽灵 block
         if self.last_layout_mode != prev_mode:
             self._dot_row_cache.clear()
+            self._star_row_history.clear()
 
         # 提取输入区 ❯ 文本（用于 MessageQueue 追踪变更）
         self.last_input_text = self._extract_input_area_text(screen, input_rows)
@@ -544,7 +550,7 @@ class ClaudeParser(BaseParser):
     # ─── Step 2+3+4：输出区解析 ────────────────────────────────────────────
 
     def _cleanup_cache(self, screen: pyte.Screen, output_row_set: Set[int]):
-        """清理 dot_row_cache 中不再有效的条目"""
+        """清理 dot_row_cache / star_row_history 中不再有效的条目"""
         for row in list(self._dot_row_cache.keys()):
             if row not in output_row_set:
                 # 行已不在输出区（屏幕滚动等）
@@ -554,6 +560,17 @@ class ClaudeParser(BaseParser):
             if col0.strip() and col0 not in DOT_CHARS:
                 # 首列变为其他非圆点内容，缓存失效
                 del self._dot_row_cache[row]
+        # 清理 star_row_history：只清理已滚出输出区的行，不根据 col0 内容变化删除
+        # 原因：星星字符闪烁时会暂时变成其他字符（如·）或空白，不应因此清空历史
+        # 历史记录本身有 1.5 秒过期机制，会自动清理过期数据
+        deleted_rows = []
+        for row in list(self._star_row_history.keys()):
+            if row not in output_row_set:
+                deleted_rows.append((row, "not_in_output"))
+                del self._star_row_history[row]
+        # 诊断日志：记录删除行为
+        if deleted_rows:
+            logger.debug(f"[diag-cleanup] deleted={deleted_rows} remaining={list(self._star_row_history.keys())}")
 
     def _parse_output_area(
         self, screen: pyte.Screen, rows: List[int]
@@ -649,8 +666,21 @@ class ClaudeParser(BaseParser):
         lines = [_get_row_text(screen, r) for r in block_rows]
 
         # 星号字符：blink → StatusLine（状态行），非 blink → SystemBlock（系统提示）
+        # 兜底：1秒滑动窗口检测（窗口内 ≥2 种不同字符 → spinner 旋转 → StatusLine）
         if col0 in STAR_CHARS:
-            if is_blink:
+            now = time.time()
+            history = self._star_row_history.setdefault(first_row, deque())
+            # 清理超过 1.5 秒的旧帧（从 1.0 延长至 1.5，覆盖更多旋转周期，减少 StatusLine 误判）
+            while history and history[0][0] < now - 1.5:
+                history.popleft()
+            history.append((now, col0))
+            # 诊断日志：记录 history 状态和判定结果
+            unique_chars = {c for _, c in history}
+            logger.debug(f"[diag-star] row={first_row} col0={col0!r} is_blink={is_blink} history_len={len(history)} unique_chars={len(unique_chars)} chars={sorted(unique_chars)!r}")
+            # 窗口内 ≥2 种不同字符 → spinner 旋转 → StatusLine
+            inferred_blink = is_blink or len(unique_chars) > 1
+            if inferred_blink:
+                logger.debug(f"[diag-star] -> StatusLine")
                 return self._parse_status_block(
                     lines[0],
                     ansi_first_line=_get_row_ansi_text(screen, first_row),
@@ -658,6 +688,7 @@ class ClaudeParser(BaseParser):
                     ansi_indicator=_get_col0_ansi(screen, first_row),
                 )
             else:
+                logger.debug(f"[diag-star] -> SystemBlock")
                 return self._parse_system_block(screen, first_row, block_rows, lines, col0)
 
         # UserInput：❯

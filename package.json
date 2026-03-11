@@ -1,6 +1,6 @@
 {
   "name": "remote-claude",
-  "version": "0.2.7",
+  "version": "0.2.10",
   "description": "双端共享 Claude CLI 工具",
   "bin": {
     "remote-claude": "bin/remote-claude",
@@ -33,7 +33,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yuyangzi/remote_claude.git"
+    "url": "git+https://github.com/yyzybb537/remote_claude.git"
   },
   "keywords": [
     "claude",

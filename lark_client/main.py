@@ -169,6 +169,13 @@ def handle_card_action(event: P2CardActionTrigger) -> P2CardActionTriggerRespons
             asyncio.create_task(handler._cmd_disband_group(user_id, chat_id, session_name, message_id=message_id))
             return None
 
+        # 列表卡片：关闭会话
+        if action_type == "list_kill":
+            session_name = action_value.get("session", "")
+            print(f"[Lark] list_kill: session={session_name}")
+            asyncio.create_task(handler._cmd_kill(user_id, chat_id, session_name, message_id=message_id))
+            return None
+
         # 目录卡片：进入子目录（继续浏览，就地更新原卡片）
         if action_type == "dir_browse":
             path = action_value.get("path", "")

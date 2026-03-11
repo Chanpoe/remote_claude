@@ -9,6 +9,7 @@ Proxy Server
 """
 
 import asyncio
+import logging
 import os
 import pty
 import signal
@@ -35,8 +36,11 @@ from utils.protocol import (
 )
 from utils.session import (
     get_socket_path, get_pid_file, ensure_socket_dir,
-    generate_client_id, cleanup_session, _safe_filename, get_env_file
+    generate_client_id, cleanup_session, _safe_filename, get_env_file,
+    SOCKET_DIR
 )
+
+logger = logging.getLogger('Server')
 
 # 加载用户 .env 配置（支持 CLAUDE_COMMAND 等）
 try:
@@ -64,6 +68,11 @@ class _FrameObs:
     status_line: Optional[object]  # 本帧的 StatusLine（None=无）
     block_blink: bool = False      # 本帧最后一个 OutputBlock 是否 is_streaming=True
     has_background_agents: bool = False  # 底部栏是否有后台 agent 信息
+    # 用于字符变化检测（增强闪烁判断）
+    last_ob_start_row: int = -1          # 最后 OutputBlock 的起始行号（跨帧识别同一 block）
+    last_ob_indicator_char: str = ''     # 指示符字符值（pyte char.data）
+    last_ob_indicator_fg: str = ''       # 指示符前景色（pyte char.fg）
+    last_ob_indicator_bold: bool = False # 指示符 bold 属性（影响显示亮度）
 
 
 @dataclass
@@ -154,6 +163,9 @@ class OutputWatcher:
 
     def feed(self, data: bytes):
         self._renderer.feed(data)  # 直接喂持久化 screen，不再缓存原始字节
+        # 诊断日志：记录 PTY 数据到达
+        if data:
+            logger.debug(f"[diag-feed] len={len(data)} data={data[:50]!r}")
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -185,6 +197,8 @@ class OutputWatcher:
 
     async def _flush(self):
         self._pending = False
+        # 诊断日志：记录 flush 触发时间和帧窗口大小
+        logger.debug(f"[diag-flush] ts={time.time():.6f} window_size={len(self._frame_window)}")
         try:
             from utils.components import StatusLine, BottomBar, Divider, OutputBlock, AgentPanelBlock, OptionBlock
 
@@ -224,10 +238,24 @@ class OutputWatcher:
             # 4a. 记录原始帧观测（必须用未平滑的原始值）
             last_ob_blink = False
             last_ob_content = ''
+            last_ob_start_row = -1
+            last_ob_indicator_char = ''
+            last_ob_indicator_fg = ''
+            last_ob_indicator_bold = False
             for b in reversed(visible_blocks):
                 if isinstance(b, OutputBlock):
                     last_ob_blink = b.is_streaming
                     last_ob_content = b.content[:40]
+                    last_ob_start_row = b.start_row
+                    # 直接读 pyte screen buffer 获取原始字符属性（用于变化检测）
+                    if b.start_row >= 0:
+                        try:
+                            char = self._renderer.screen.buffer[b.start_row][0]
+                            last_ob_indicator_char = str(getattr(char, 'data', ''))
+                            last_ob_indicator_fg = str(getattr(char, 'fg', ''))
+                            last_ob_indicator_bold = bool(getattr(char, 'bold', False))
+                        except (KeyError, IndexError):
+                            pass
                     break
             if last_ob_blink:
                 _blink_log = open(f"/tmp/remote-claude/{self._session_name}_blink.log", "a")
@@ -241,6 +269,10 @@ class OutputWatcher:
                 status_line=raw_status_line,
                 block_blink=last_ob_blink,
                 has_background_agents=getattr(raw_bottom_bar, 'has_background_agents', False) if raw_bottom_bar else False,
+                last_ob_start_row=last_ob_start_row,
+                last_ob_indicator_char=last_ob_indicator_char,
+                last_ob_indicator_fg=last_ob_indicator_fg,
+                last_ob_indicator_bold=last_ob_indicator_bold,
             ))
             cutoff = now - self.WINDOW_SECONDS
             while self._frame_window and self._frame_window[0].ts < cutoff:
@@ -262,9 +294,27 @@ class OutputWatcher:
                 None
             )
 
-            # 4c. block blink 平滑：窗口内任意帧有 blink → streaming
-            #     修改 visible_blocks 中最后一个 OutputBlock（平滑后再合并）
+            # 4c. block blink 平滑：两种触发路径
+            # 路径1：窗口内任意帧有 pyte blink 属性
             window_block_active = any(o.block_blink for o in window_list)
+
+            # 路径2：窗口内同一 block 的指示符字符值/颜色/bold 有变化（增强闪烁判断）
+            if not window_block_active and last_ob_start_row >= 0:
+                same_block = [o for o in window_list if o.last_ob_start_row == last_ob_start_row]
+                if len(same_block) >= 2:
+                    chars = {o.last_ob_indicator_char for o in same_block if o.last_ob_indicator_char}
+                    fgs   = {o.last_ob_indicator_fg   for o in same_block if o.last_ob_indicator_fg}
+                    bolds = {o.last_ob_indicator_bold for o in same_block}
+                    if len(chars) > 1 or len(fgs) > 1 or len(bolds) > 1:
+                        window_block_active = True
+                        # 记录字符变化触发原因
+                        _blink_log = open(f"/tmp/remote-claude/{self._session_name}_blink.log", "a")
+                        _blink_log.write(
+                            f"[{time.strftime('%H:%M:%S')}] char-change row={last_ob_start_row}"
+                            f"  chars={chars}  fgs={fgs}  bolds={bolds}\n"
+                        )
+                        _blink_log.close()
+
             if window_block_active:
                 for b in reversed(visible_blocks):
                     if isinstance(b, OutputBlock):
@@ -303,6 +353,16 @@ class OutputWatcher:
                 layout_mode=self._parser.last_layout_mode,
                 cli_type=self._cli_type,
             )
+            # 诊断日志：检测最终输出中是否有同时存在 status_line 和 SystemBlock 的情况
+            if display_status:
+                status_prefix = display_status.raw[:30] if hasattr(display_status, 'raw') else str(display_status)[:30]
+                has_systemblock_with_status = any(
+                    b.__class__.__name__ == 'SystemBlock' and
+                    hasattr(b, 'content') and status_prefix in b.content
+                    for b in all_blocks
+                )
+                if has_systemblock_with_status:
+                    logger.debug(f"[diag-output] BOTH status_line and SystemBlock present! status_line={status_prefix!r}")
             self.last_window = window
 
             # 7. 输出
@@ -342,7 +402,7 @@ class OutputWatcher:
                     lines.append(f"      ansi_raw={sl.ansi_raw[:120]!r}")
                     lines.append(f"      ansi_render: {sl.ansi_indicator} {sl.ansi_raw[:120]}\x1b[0m")
                 else:
-                    lines.append(f"status_line: {sl.ansi_indicator} {sl.ansi_raw[:120]}\x1b[0m")
+                    lines.append(f"status_line: {sl.ansi_raw[:120]}\x1b[0m")
             else:
                 lines.append("status_line: None")
             # BottomBar
@@ -529,7 +589,7 @@ class ClientConnection:
             self.writer.write(data)
             await self.writer.drain()
         except Exception as e:
-            print(f"[Server] 发送消息失败 ({self.client_id}): {e}")
+            logger.warning(f"发送消息失败 ({self.client_id}): {e}")
 
     async def read_message(self) -> Optional[Message]:
         """读取一条消息"""
@@ -540,7 +600,7 @@ class ClientConnection:
                 try:
                     return decode_message(line)
                 except Exception as e:
-                    print(f"[Server] 解析消息失败: {e}")
+                    logger.warning(f"解析消息失败: {e}")
                     continue
 
             # 读取更多数据
@@ -608,6 +668,8 @@ class ProxyServer:
 
     async def start(self):
         """启动服务器"""
+        t0 = time.time()
+        logger.info(f"正在启动 (session={self.session_name})")
         ensure_socket_dir()
 
         # 清理旧的 socket 文件
@@ -615,12 +677,15 @@ class ProxyServer:
             self.socket_path.unlink()
 
         # 启动 PTY
+        t1 = time.time()
         self._start_pty()
+        logger.info(f"PTY 已启动 ({(time.time()-t1)*1000:.0f}ms)")
 
         # 写入 PID 文件
         self.pid_file.write_text(str(os.getpid()))
 
         # 启动 Unix Socket 服务器
+        t2 = time.time()
         self.server = await asyncio.start_unix_server(
             self._handle_client,
             path=str(self.socket_path)
@@ -628,7 +693,7 @@ class ProxyServer:
 
         self.running = True
         _track_stats('session', 'start', session_name=self.session_name)
-        print(f"[Server] 已启动: {self.socket_path}")
+        logger.info(f"已启动: {self.socket_path} (Socket {(time.time()-t2)*1000:.0f}ms, 总计 {(time.time()-t0)*1000:.0f}ms)")
 
         # 启动 PTY 读取任务
         asyncio.create_task(self._read_pty())
@@ -664,8 +729,14 @@ class ProxyServer:
         try:
             with open(env_snapshot_path) as _f:
                 _extra_env = _json.load(_f)
+            logger.info(f"环境快照已加载 ({len(_extra_env)} 个变量)")
         except Exception:
-            pass
+            logger.warning("环境快照加载失败，使用当前进程环境")
+
+        # 提前计算命令（fork 后父子进程共享，方便父进程打印和子进程执行）
+        import shlex as _shlex
+        _cmd_parts = _shlex.split(self._get_effective_cmd())
+        _full_cmd = ' '.join(_cmd_parts + self.claude_args)
 
         try:
             pid, fd = pty.fork()
@@ -688,10 +759,25 @@ class ProxyServer:
             # 清除 tmux 标识变量（PTY 数据不经过 tmux，不应让 Claude CLI 误判终端环境）
             child_env.pop('TMUX', None)
             child_env.pop('TMUX_PANE', None)
-            import shlex as _shlex
-            _cmd_parts = _shlex.split(self._get_effective_cmd())
-            os.execvpe(_cmd_parts[0], _cmd_parts + self.claude_args, child_env)
-            os._exit(1)  # execvpe 失败时兜底退出
+            try:
+                os.execvpe(_cmd_parts[0], _cmd_parts + self.claude_args, child_env)
+            except Exception as _e:
+                msg = f"启动失败: 命令 '{_cmd_parts[0]}' 无法执行: {_e}"
+                os.write(1, (msg + "\n").encode())  # 写到 PTY
+                # fork 后不能安全使用 logging，直接追加写日志文件
+                try:
+                    import time as _t
+                    _ts = _t.strftime("%Y-%m-%d %H:%M:%S")
+                    _ms = int((_t.time() % 1) * 1000)
+                    _log_line = f"{_ts}.{_ms:03d} [Server] ERROR {msg}\n"
+                    _home = os.path.expanduser("~")
+                    _log_file = os.path.join(_home, ".remote-claude", "startup.log")
+                    with open(_log_file, "a", encoding="utf-8") as _f:
+                        _f.write(_log_line)
+                except Exception:
+                    pass
+                os._exit(127)  # 127 = command not found (shell convention)
+            os._exit(1)  # 理论上不可达
         else:
             # 父进程
             self.master_fd = fd
@@ -706,7 +792,10 @@ class ProxyServer:
             fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
             cli_label = self.cli_type.capitalize()
-            print(f"[Server] {cli_label} 已启动 (PID: {pid}, PTY: {self.PTY_COLS}×{self.PTY_ROWS})")
+            logger.info(f"启动命令: {_full_cmd}")
+            logger.info(f"{cli_label} 已启动 (PID: {pid}, PTY: {self.PTY_COLS}×{self.PTY_ROWS})")
+
+    _COALESCE_MAX = 64 * 1024  # 64KB，防止单次广播过大
 
     async def _read_pty(self):
         """读取 PTY 输出并广播"""
@@ -714,15 +803,26 @@ class ProxyServer:
 
         while self.running and self.master_fd is not None:
             try:
-                # 使用 asyncio 读取
+                # 第一次 read（在线程池中，可能阻塞等待数据）
                 data = await loop.run_in_executor(
                     None, self._read_pty_sync
                 )
                 if data:
+                    # 贪婪合并：非阻塞读取紧接数据，合并为一次广播
+                    buf = bytearray(data)
+                    while len(buf) < self._COALESCE_MAX:
+                        try:
+                            more = os.read(self.master_fd, 4096)
+                            if not more:
+                                break
+                            buf.extend(more)
+                        except (BlockingIOError, OSError):
+                            break
+                    coalesced = bytes(buf)
                     # 保存到历史
-                    self.history.append(data)
+                    self.history.append(coalesced)
                     # 广播给所有客户端
-                    await self._broadcast_output(data)
+                    await self._broadcast_output(coalesced)
                 elif data is None:
                     # 暂时无数据（BlockingIOError），稍等继续
                     await asyncio.sleep(0.01)
@@ -731,11 +831,19 @@ class ProxyServer:
                     break
             except Exception as e:
                 if self.running:
-                    print(f"[Server] 读取 PTY 错误: {e}")
+                    logger.error(f"读取 PTY 错误: {e}")
                 break
 
-        # Claude 退出
-        print("[Server] Claude 已退出")
+        # Claude 退出，获取 exit code 以便诊断
+        try:
+            _, status = os.waitpid(self.child_pid, os.WNOHANG)
+            if status != 0:
+                exit_code = os.waitstatus_to_exitcode(status)
+                logger.error(f"CLI 进程异常退出 (exit_code={exit_code})")
+            else:
+                logger.info("Claude 已退出")
+        except Exception:
+            logger.info("Claude 已退出")
         await self._shutdown()
 
     def _read_pty_sync(self) -> Optional[bytes]:
@@ -753,7 +861,7 @@ class ProxyServer:
         client = ClientConnection(client_id, reader, writer)
         self.clients[client_id] = client
 
-        print(f"[Server] 客户端连接: {client_id}")
+        logger.info(f"客户端连接: {client_id}")
         _track_stats('session', 'attach', session_name=self.session_name)
 
         # 发送历史输出
@@ -769,12 +877,12 @@ class ProxyServer:
                     break
                 await self._handle_message(client_id, msg)
         except Exception as e:
-            print(f"[Server] 客户端处理错误 ({client_id}): {e}")
+            logger.error(f"客户端处理错误 ({client_id}): {e}")
         finally:
             # 清理
             del self.clients[client_id]
             client.close()
-            print(f"[Server] 客户端断开: {client_id}")
+            logger.info(f"客户端断开: {client_id}")
 
     async def _handle_message(self, client_id: str, msg: Message):
         """处理客户端消息"""
@@ -791,7 +899,7 @@ class ProxyServer:
             _track_stats('terminal', 'input', session_name=self.session_name,
                          value=len(data))
         except Exception as e:
-            print(f"[Server] 写入 PTY 错误: {e}")
+            logger.error(f"写入 PTY 错误: {e}")
 
         # 广播输入给其他客户端（飞书侧可以感知终端用户的输入内容）
         for cid, client in list(self.clients.items()):
@@ -811,7 +919,7 @@ class ProxyServer:
             winsize = struct.pack('HHHH', msg.rows, msg.cols, 0, 0)
             fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
         except Exception as e:
-            print(f"[Server] 调整终端大小错误: {e}")
+            logger.error(f"调整终端大小错误: {e}")
 
     async def _broadcast_output(self, data: bytes):
         """广播输出给所有客户端，同时喂给 OutputWatcher 生成快照"""
@@ -850,7 +958,7 @@ class ProxyServer:
         # 清理文件
         cleanup_session(self.session_name)
 
-        print("[Server] 已关闭")
+        logger.info("已关闭")
 
 
 def run_server(session_name: str, claude_args: list = None,
@@ -890,7 +998,22 @@ if __name__ == "__main__":
                         help="debug 日志输出完整诊断信息（indicator、repr 等）")
     args = parser.parse_args()
 
+    # 配置日志：写文件（供故障诊断）+ stdout（供 tmux attach 时查看）
+    from utils.session import USER_DATA_DIR
+    USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _log_path = USER_DATA_DIR / "startup.log"
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s.%(msecs)03d [%(name)s] %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(_log_path, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
     claude_cmd = os.environ.get("CLAUDE_COMMAND", "claude")
+    logger.info(f"CLAUDE_COMMAND={claude_cmd!r}")
     run_server(args.session_name, args.claude_args, claude_cmd=claude_cmd,
                cli_type=args.cli_type,
                debug_screen=args.debug_screen, debug_verbose=args.debug_verbose)

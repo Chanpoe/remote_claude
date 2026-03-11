@@ -11,11 +11,13 @@ Remote Claude - 双端共享 Claude CLI 工具
 """
 
 import argparse
+import logging
 import os
 import sys
 import subprocess
 import time
 import signal
+from datetime import datetime
 from pathlib import Path
 
 # 确保项目根目录在 sys.path 中，以便 import client / server 子模块
@@ -31,7 +33,7 @@ from utils.session import (
     is_lark_running, get_lark_pid, get_lark_status, get_lark_pid_file,
     save_lark_status, cleanup_lark,
     USER_DATA_DIR, ensure_user_data_dir, get_lark_log_file,
-    get_env_snapshot_path
+    get_env_snapshot_path,
 )
 
 
@@ -91,7 +93,22 @@ def cmd_start(args):
 
     server_cmd = f"{env_prefix}uv run --project '{SCRIPT_DIR}' python3 '{server_script}'{debug_flag}{debug_verbose_flag}{cli_type_flag} -- '{session_name}' {claude_args_str}"
 
-    print(f"启动会话: {session_name}")
+    # 配置启动日志（写文件 + stdout）
+    _log_path = USER_DATA_DIR / "startup.log"
+    _start_logger = logging.getLogger('Start')
+    if not _start_logger.handlers:
+        _handler_file = logging.FileHandler(_log_path, encoding="utf-8")
+        _handler_file.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d [%(name)s] %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        _start_logger.addHandler(_handler_file)
+        _start_logger.setLevel(logging.INFO)
+        _start_logger.propagate = False
+
+    start_time = datetime.now()
+    _start_logger.info(f"启动会话: {session_name}")
+    _start_logger.info(f"server_cmd: {server_cmd}")
 
     # 创建 tmux 会话，运行 server（detached，仅后台）
     if not tmux_create_session(session_name, server_cmd, detached=True):
@@ -100,12 +117,30 @@ def cmd_start(args):
 
     # 等待 server 启动
     socket_path = get_socket_path(session_name)
-    for _ in range(50):  # 最多等待 5 秒
+    for i in range(50):  # 最多等待 5 秒
         if socket_path.exists():
             break
         time.sleep(0.1)
+        if (i + 1) % 10 == 0:
+            elapsed = (i + 1) // 10
+            print(f"等待 Server 启动... ({elapsed}s)")
     else:
-        print("错误: Server 启动超时")
+        print("错误: Server 启动超时 (5s)")
+        # 过滤出本次启动后的日志行
+        if _log_path.exists():
+            lines = []
+            for line in _log_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    ts = datetime.strptime(line[:23], "%Y-%m-%d %H:%M:%S.%f")
+                    if ts >= start_time:
+                        lines.append(line)
+                except ValueError:
+                    if lines:  # 多行日志的续行，附到上一条
+                        lines.append(line)
+            if lines:
+                print(f"--- Server 日志 ({_log_path}) ---")
+                print("\n".join(lines))
+                print("-------------------")
         tmux_kill_session(session_name)
         return 1
 
